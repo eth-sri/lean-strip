@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lean-strip"
+version = "1.0.0"
+description = "Strip a Lean repository down to what its protected results need."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+lean-strip = "lean_strip.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lean_strip"]
