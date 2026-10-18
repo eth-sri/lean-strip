@@ -1,6 +1,6 @@
 # lean-strip
 
-`lean-strip` removes the Lean code that a repository's main results do not need. It is the preprocessing step of the LeanLean benchmark, packaged as one command, and it works on any repository in the [Palomar registry](https://palomar-registry.org).
+`lean-strip` removes the Lean code that a repository's main results do not need. It is part of the [LeanLean](https://leanleanbench.com) project: the preprocessing step of the LeanLean benchmark, packaged as one command. It works on any repository in the [Palomar registry](https://palomar-registry.org).
 
 It works on a Palomar-registry style repository: a Lake project with a comparator config (usually `comparator.json`) and the solution and challenge modules it names.
 
