@@ -1,9 +1,9 @@
 """The scratch checkout the pipeline runs against.
 
 The pipeline addresses the project as ``/testbed`` and its helper files as
-``/tmp/...``, the paths the LeanLean benchmark uses. ``LocalWorkspace`` keeps
-those logical paths, so every planner sees the same path keys as the
-benchmark, and maps them to the real scratch directories only when it runs a
+``/tmp/...``, the paths it had in the LeanLean benchmark's containers.
+``LocalWorkspace`` keeps those logical paths, so every planner sees stable
+path keys, and maps them to the real scratch directories only when it runs a
 process or touches a file.
 """
 
@@ -40,8 +40,12 @@ class LocalWorkspace:
         default_timeout: int,
         lean_threads: int,
         command_log: Callable[[str], None] | None = None,
+        project_skip: tuple[str, ...] = (),
     ) -> None:
         self.root = root.resolve()
+        # Relative directories under the root that are not project sources,
+        # such as packages vendored through a lakefile `path` require.
+        self.project_skip = project_skip
         self.tmp = scratch.resolve()
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.default_timeout = default_timeout
@@ -52,11 +56,17 @@ class LocalWorkspace:
         self._log = command_log or (lambda _line: None)
         self._env = {
             **os.environ,
-            # The benchmark runs under the POSIX locale; `sort` and
-            # `find | sort` orderings must match it byte for byte.
+            # The POSIX locale keeps `sort` and `find | sort` orderings
+            # independent of the host's language settings.
             "LC_ALL": "C",
             "LEAN_NUM_THREADS": str(lean_threads),
         }
+
+    @property
+    def environment(self) -> dict[str, str]:
+        """The environment every command runs with; callers may adjust it."""
+
+        return self._env
 
     # -- path translation ---------------------------------------------------
 

@@ -137,6 +137,12 @@ def union_ilean_documents(
     # non-persistent validation commands are removed using Lean frontend
     # ranges (examples.py) instead of rooting everything they mention.
     owner_unresolved_targets: set[str] = set()
+    # Usages whose `.ilean` owner is a declaration the graph does not have: a
+    # project redeclaration of a dependency's identical theorem, which import
+    # attributes to the dependency (PALOMAR-2026-10-10-000001's copy of
+    # mathlib's `HasIndepIncrements.isGaussianProcess`). Its text stays, so
+    # what it uses must too.
+    shadowed_owner_targets: set[str] = set()
     anonymous_example_modules: set[str] = set()
     anonymous_example_targets: set[str] = set()
     anonymous_example_targets_by_module: dict[str, set[str]] = defaultdict(set)
@@ -246,6 +252,10 @@ def union_ilean_documents(
                         anonymous_example_targets_by_module[module].update(targets)
                     else:
                         owner_unresolved_targets.update(targets)
+                        # Not a generated command auxiliary such as `#eval`'s
+                        # `_private.M.0._eval`: those name no declaration.
+                        if raw_named_owner is not None and not raw_named_owner.rsplit(".", 1)[-1].startswith("_"):
+                            shadowed_owner_targets.update(targets)
                     continue
                 if len(owners) > 1:
                     ambiguous_owner_usages += 1
@@ -283,6 +293,7 @@ def union_ilean_documents(
         "owner_unresolved": sorted(owner_unresolved),
         "owner_unresolved_targets": sorted(owner_unresolved_targets),
         "owner_unresolved_target_count": len(owner_unresolved_targets),
+        "shadowed_owner_targets": sorted(shadowed_owner_targets),
         "anonymous_example_modules": sorted(anonymous_example_modules),
         "anonymous_example_module_count": len(anonymous_example_modules),
         "anonymous_example_targets": sorted(anonymous_example_targets),

@@ -133,7 +133,7 @@ def summarize(
     return {
         "repository": str(repo),
         "dry_run": dry_run,
-        "scope": "all .lean files except lakefile.lean, the challenge (which is never modified) and lakefile root stubs",
+        "scope": "all .lean files except lakefile.lean and the challenge (which is never modified)",
         "totals": _saved(before["totals"], after["totals"]),
         "phases": {
             "isolation": _saved(before["totals"], isolated_totals),
@@ -162,6 +162,7 @@ def summarize(
             "files_with_calls": len(grind_files),
             "files_retained_whole": grind.get("retained_failed_files", []),
         },
+        "build_fallback": report.get("build_fallback"),
         "strip_summary": report.get("strip", {}),
         "timing_sec": report.get("timing_sec", {}),
         "isolation": {
@@ -240,10 +241,56 @@ def render_summary(outcome: dict[str, Any]) -> str:
             lines.append(f"  - {path}")
         if len(non_lean) > 12:
             lines.append(f"  ... {len(non_lean) - 12} more")
-    stubs = outcome.get("lake_root_stubs") or []
-    if stubs:
-        lines.append(
-            "lakefile roots: " + ", ".join(stubs) + " kept as import-only stub(s) of the "
-            "surviving modules, so plain `lake build` still works"
-        )
+    fallback = outcome.get("build_fallback")
+    if fallback:
+        lines.extend(fallback_lines(fallback))
+    lines.extend(lakefile_warnings(outcome.get("lakefile") or {}))
+    verdict = outcome.get("comparator")
+    if verdict and verdict.get("status") == "accepted":
+        lines.append(f"comparator: {verdict.get('judge')} accepts the stripped solution"
+                     + ("" if verdict.get("sandbox") else " (judged without a sandbox; lean-strip built the same code itself)"))
+    elif verdict and verdict.get("status") == "unavailable":
+        lines.append(f"warning: comparator could not run: {verdict['reason']}")
     return "\n".join(lines)
+
+
+def fallback_lines(fallback: dict[str, Any]) -> list[str]:
+    """The summary's account of what the build fallback changed."""
+
+    def shown(paths: list[str]) -> str:
+        return ", ".join(path.removeprefix("/testbed/") for path in paths)
+
+    rounds = fallback.get("rounds", 1)
+    lines = [f"warning: the stripped tree did not build; lean-strip repaired it in "
+             f"{rounds} rebuild{'s' if rounds != 1 else ''}:"]
+    for raised in fallback.get("heartbeats") or []:
+        lines.append(f"  - `set_option {raised['option']} {raised['value']} in` before "
+                     f"{raised['declaration'][:70]} ({raised['path'].removeprefix('/testbed/')}): "
+                     "it elaborates more slowly in the stripped tree")
+    silenced = fallback.get("private_module_lint_silenced") or []
+    if silenced:
+        lines.append(f"  - `set_option linter.privateModule false` in {shown(silenced[:4])}")
+    if fallback.get("grind_restored_files"):
+        lines.append(f"  - restored {len(fallback['grind_restored_files'])} file(s) unstripped where grind failed: "
+                     + shown(fallback["grind_restored_files"][:6]))
+    lines.append("  First errors:")
+    lines.extend("    " + line[:200] for line in fallback.get("errors", [])[:4])
+    return lines
+
+
+def lakefile_warnings(lake: dict[str, Any]) -> list[str]:
+    """Warnings about the lakefile edit and plain `lake build`, for the summary."""
+
+    lines: list[str] = []
+    if lake.get("rewritten"):
+        lines.append(f"warning: {lake['path']} was edited because the strip deleted modules it names:")
+        lines.extend(f"  - {change}" for change in lake.get("changes", []))
+    if lake.get("unresolved"):
+        lines.append(f"warning: {lake.get('path')} may still name deleted modules; check by hand:")
+        lines.extend(f"  - {problem}" for problem in lake["unresolved"])
+    build = lake.get("lake_build") or {}
+    if build and not build.get("ok"):
+        lines.append("warning: plain `lake build` fails on the stripped tree "
+                     "(the solution and challenge were checked and build); last lines:")
+        lines.extend("    " + line for line in build.get("output_tail", "").splitlines()[-10:])
+    return lines

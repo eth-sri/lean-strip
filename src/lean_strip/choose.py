@@ -40,17 +40,34 @@ def load_comparator(path: Path) -> dict[str, Any]:
 
 
 def find_comparators(repo: Path, skip: tuple[str, ...]) -> list[Path]:
-    """Every ``comparator*.json`` in ``repo``, outside build, VCS and ``skip`` directories."""
+    """Every comparator config in ``repo``, outside build, VCS and ``skip`` directories.
+
+    That is every ``comparator*.json``, plus any other small JSON file that names
+    a ``solution_module`` and a ``challenge_module`` (registry configs are also
+    called ``config.json``, ``theorem_one_two.json``, ...).
+    """
 
     found: list[Path] = []
     for current, directories, files in os.walk(repo):
         directories[:] = sorted(d for d in directories if d not in {".git", ".lake", *skip})
-        found.extend(
-            Path(current) / name
-            for name in files
-            if name.lower().startswith("comparator") and name.lower().endswith(".json")
-        )
+        for name in files:
+            path = Path(current) / name
+            lower = name.lower()
+            if not lower.endswith(".json"):
+                continue
+            if lower.startswith("comparator") or _looks_like_comparator(path):
+                found.append(path)
     return sorted(found)
+
+
+def _looks_like_comparator(path: Path) -> bool:
+    try:
+        if path.stat().st_size > 1_000_000:
+            return False
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and "solution_module" in config and "challenge_module" in config
 
 
 def describe(repo: Path, path: Path, config: dict[str, Any]) -> str:

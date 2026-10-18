@@ -29,7 +29,10 @@ from typing import Any
 # DEP edges are the project-local names appearing in a decl's type/value Expr
 # (via Expr.foldConsts over the full type and value), each mapped to its nearest
 # emitted source owner, plus structural edges (ctor->inductive, rec->family,
-# inductive->ctors) so seeding any member pulls its whole family.
+# inductive->ctors) so seeding any member pulls its whole family. Range-less
+# auxiliaries a term references (`foo._proof_1`, `match_n`, `grind`/`omega`
+# auxiliary theorems) are followed into their own type and value, so a lemma
+# used only inside one is still a dependency of the declaration.
 #
 # EXTNS lists namespace prefixes that also contain declarations from outside
 # the project modules, i.e. namespaces the project extends rather than owns.
@@ -42,6 +45,35 @@ from typing import Any
 _DUMP_KEEP_LEAN = r"""
 import Lean
 open Lean Meta
+
+/-- The ranged project declarations reachable from the range-less project
+constant `n` (`foo._proof_1`, `foo.match_1`, a `grind`/`omega` auxiliary, ...)
+through its type and value, following further range-less constants.
+Memoized; a constant on the current path counts as empty, which cuts cycles. -/
+partial def auxOwners (env : Environment) (isProject : Name → Bool)
+    (ranged : NameHashSet) (owner? : Name → Option Name)
+    (memo : IO.Ref (Std.HashMap Name (Array Name))) (n : Name) : IO (Array Name) := do
+  if let some cached := (← memo.get)[n]? then
+    return cached
+  memo.modify (·.insert n #[])
+  let some cinfo := env.find? n | return #[]
+  let exprs := match cinfo with
+    | .defnInfo val   => #[val.type, val.value]
+    | .thmInfo val    => #[val.type, val.value]
+    | .opaqueInfo val => #[val.type, val.value]
+    | info            => #[info.type]
+  let consts := exprs.foldl
+    (fun acc e => e.foldConsts acc fun c acc => if isProject c && c != n then acc.push c else acc) #[]
+  let mut out : Array Name := #[]
+  for c in consts do
+    if ranged.contains c then
+      out := out.push c
+    else
+      if let some owner := owner? c then
+        out := out.push owner
+      out := out ++ (← auxOwners env isProject ranged owner? memo c)
+  memo.modify (·.insert n out)
+  return out
 
 unsafe def main (args : List String) : IO Unit := do
   initSearchPath (← findSysroot)
@@ -119,6 +151,7 @@ unsafe def main (args : List String) : IO Unit := do
   let ((nodes, projNameSet, importedNamespaces), _) ← action.toIO coreCtx coreState
 
   -- Pass 2: emit DECL + DEP for each node.
+  let auxMemo ← IO.mkRef ({} : Std.HashMap Name (Array Name))
   for (name, modName, cinfo, rangeStr) in nodes do
     let kind := match cinfo with
       | .thmInfo _    => "theorem"
@@ -145,21 +178,32 @@ unsafe def main (args : List String) : IO Unit := do
         none
       else
         findSourceOwner? n.getPrefix
-    let findRefs (e : Expr) (acc : Array Name) : Array Name :=
-      e.foldConsts acc fun n acc =>
-        if !isProjectConstant n then
-          acc
-        else
-          match findSourceOwner? n with
-          | some owner =>
-            if owner != name then acc.push owner else acc
-          | none => acc
-    let mut refs := findRefs cinfo.type #[]
-    refs := match cinfo with
-      | .defnInfo val   => findRefs val.value refs
-      | .thmInfo val    => findRefs val.value refs
-      | .opaqueInfo val => findRefs val.value refs
-      | _               => refs
+    -- Project constants referenced by the type and value. A range-less one
+    -- (`name._proof_1`, a `match` or `grind` auxiliary) folds to its ranged
+    -- owner, and its own body is followed too: a lemma used only inside such
+    -- an auxiliary is a dependency of `name` that the term itself never names.
+    let exprs := match cinfo with
+      | .defnInfo val   => #[cinfo.type, val.value]
+      | .thmInfo val    => #[cinfo.type, val.value]
+      | .opaqueInfo val => #[cinfo.type, val.value]
+      | _               => #[cinfo.type]
+    let consts := exprs.foldl
+      (fun acc e => e.foldConsts acc fun n acc => if isProjectConstant n then acc.push n else acc) #[]
+    let mut refs : Array Name := #[]
+    for n in consts do
+      if projNameSet.contains n then
+        refs := refs.push n
+      else
+        if let some owner := findSourceOwner? n then
+          refs := refs.push owner
+        refs := refs ++ (← auxOwners env isProjectConstant projNameSet findSourceOwner? auxMemo n)
+    let mut seen : NameHashSet := {}
+    let mut unique : Array Name := #[]
+    for ref in refs do
+      if ref != name && !seen.contains ref then
+        seen := seen.insert ref
+        unique := unique.push ref
+    refs := unique
     refs := match cinfo with
       | .ctorInfo val   => refs.push val.induct
       | .recInfo val    => refs ++ val.all.toArray

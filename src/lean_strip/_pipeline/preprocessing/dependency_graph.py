@@ -102,6 +102,24 @@ class DependencyGraph:
     module_paths: dict[str, str]
     evidence: dict
     edge_layers: dict[str, set[tuple[str, str]]]
+    source_dirs: list[str] | None = None
+
+
+def project_source_dirs(env: Any) -> list[str] | None:
+    """The project's own ``LEAN_SRC_PATH`` entries, in Lean's search order."""
+
+    result = env.execute("cd /testbed && lake env printenv LEAN_SRC_PATH")
+    if result["returncode"] != 0:
+        return None
+    lines = [line for line in result["output"].splitlines() if line.strip()]
+    if not lines:
+        return None
+    return [
+        directory.rstrip("/")
+        for directory in lines[-1].strip().split(":")
+        if (directory == "/testbed" or directory.startswith("/testbed/"))
+        and "/.lake/" not in directory + "/"
+    ] or None
 
 
 def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
@@ -130,7 +148,8 @@ def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
     if not declarations:
         raise RuntimeError("Dependency graph extraction returned no declarations")
     names = {str(d["module"]) for d in declarations}
-    paths = lean_strip.resolve_module_paths(names | set(modules), list(originals))
+    source_dirs = project_source_dirs(env)
+    paths = lean_strip.resolve_module_paths(names | set(modules), list(originals), source_dirs)
     missing = names - set(paths)
     if missing and not allow_missing_sources:
         raise RuntimeError("Source mapping missing for modules: " + ", ".join(sorted(missing)))
@@ -139,4 +158,5 @@ def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
         declarations, kernel, dict(originals), paths,
         modules=set(modules) | names,
     )
-    return DependencyGraph(declarations, dependencies, namespaces, originals, paths, evidence, layers)
+    return DependencyGraph(declarations, dependencies, namespaces, originals, paths, evidence, layers,
+                           source_dirs)

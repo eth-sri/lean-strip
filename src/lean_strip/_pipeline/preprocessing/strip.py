@@ -24,8 +24,9 @@ Key facts about the ranges (verified empirically against the pinned toolchains):
 from __future__ import annotations
 
 import difflib
+import functools
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 DeclRange = dict[str, Any]
@@ -58,6 +59,8 @@ _ID_REST = _ID_FIRST + "0-9'!?" + "\u2080-\u2089\u2090-\u209C\u1D62-\u1D6A\u2C7C
 # One identifier, possibly dotted (`Nat.succ`, `h.1`, `hx.le`).
 _LEAN_COMMAND_NAME_PATTERN = f"[{_ID_FIRST}][{_ID_REST}.]*"
 _IDENT_RE = re.compile(_LEAN_COMMAND_NAME_PATTERN)
+# `` `Foo.bar `` and ``` ``Foo.bar ```: a Lean `Name` literal.
+_QUOTED_NAME_RE = re.compile(rf"(?<![{_ID_REST}`])``?({_LEAN_COMMAND_NAME_PATTERN})")
 # End of a command keyword. `\b` is wrong here: `'`, `!` and `?` continue a
 # Lean identifier, so `\bsection\b` matches the structure field `section'`.
 _KW_END = rf"(?![{_ID_REST}])"
@@ -414,6 +417,30 @@ def augment_deps_with_source(
                     and (outer_start, outer_end) != (child_start, child_end)
                 ):
                     edges.add(outer["name"])
+
+    # A quoted name (`` `Foo.bar `` or ``` ``Foo.bar ```) is looked up when the
+    # code runs, in the environment of whichever module uses it, not of the
+    # module that wrote it: `resolveConst? `FourColor.contractProg` inside a
+    # command elaborator (PALOMAR-2026-09-27-000005). Exact full names are
+    # matched against every project declaration, without the visibility filter.
+    all_names = {str(decl["name"]) for decl in decls}
+    for d in decls:
+        path = mod_path.get(d["module"])
+        cached_lines = source_lines_by_path.get(path) if path else None
+        if d["start_line"] is None or cached_lines is None:
+            continue
+        code_lines, namespace_contexts = cached_lines[1], cached_lines[2]
+        start_line = int(d["start_line"])
+        span = "\n".join(code_lines[start_line - 1 : int(d["end_line"])])
+        for match in _QUOTED_NAME_RE.finditer(span):
+            name = match.group(1).removeprefix("_root_.")
+            # ``Foo resolves through the enclosing namespaces when it is written.
+            line = start_line + span.count("\n", 0, match.start())
+            candidates = (_namespace_name_candidates(name, namespace_contexts.get(line, ""))
+                          if match.group(0).startswith("``") else [name])
+            hit = next((candidate for candidate in candidates if candidate in all_names), None)
+            if hit is not None and hit != d["name"]:
+                out.setdefault(d["name"], set()).add(hit)
     return out
 
 
@@ -434,6 +461,10 @@ _ATTRIBUTE_CMD_RE = re.compile(
 
 
 def _attribute_command_payloads(text: str) -> list[str]:
+    return [payload for _line, payload in _attribute_command_payloads_with_lines(text)]
+
+
+def _attribute_command_payloads_with_lines(text: str) -> list[tuple[int, str]]:
     """Return source payloads of standalone ``attribute [...]`` commands.
 
     The payload excludes the attribute list itself and includes indented
@@ -445,7 +476,7 @@ def _attribute_command_payloads(text: str) -> list[str]:
     """
 
     lines = _mask_comments_preserve_layout(text).split("\n")
-    payloads: list[str] = []
+    payloads: list[tuple[int, str]] = []
     i = 0
     while i < len(lines):
         match = _ATTRIBUTE_CMD_RE.match(lines[i])
@@ -462,7 +493,7 @@ def _attribute_command_payloads(text: str) -> list[str]:
         while j < len(lines) and lines[j].strip() and lines[j][:1].isspace():
             payload.append(lines[j])
             j += 1
-        payloads.append(" ".join(payload).strip())
+        payloads.append((i + 1, " ".join(payload).strip()))
         i = max(j, i + 1)
     return payloads
 
@@ -478,7 +509,15 @@ def _is_prefix_attribute(payload: str) -> bool:
 # (a surviving proof invokes the syntax, but the call site names no constant).
 # Force-keep any decl whose command header is one of these. The keyword may sit
 # behind attributes and modifiers (`@[…] noncomputable scoped instance …`).
-_FORCE_KEEP_KINDS = r"instance|macro_rules|macro|elab_rules|elab|syntax|notation"
+# `deriving instance C for T` is an instance too; its range is that command, so
+# dropping it as unused deletes a `deriving instance … in` prefix the next
+# declaration needs. Mixfix notation, unification hints, binder predicates,
+# syntax categories and simprocs are likewise used without being named.
+_FORCE_KEEP_KINDS = (
+    r"deriving\s+instance|instance|macro_rules|macro|elab_rules|elab|syntax|notation"
+    r"|infixl|infixr|infix|prefix|postfix|unif_hint|binder_predicate|declare_syntax_cat"
+    r"|simproc|dsimproc"
+)
 _KIND_KW_RE = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
     r"(?:public\s+|private\s+|protected\s+|noncomputable\s+|scoped\s+|local\s+|"
@@ -511,7 +550,16 @@ def detect_automation_tagged(
         # annotations, never inside tactic blocks, so a body `by simp` is safe).
         # The range includes a leading docstring, so an `@[simp]` between the
         # docstring and keyword is in-span.
-        if _ATTR_TAG_RE.search("\n".join(lines[start - 1:end])):
+        span = "\n".join(lines[start - 1:end])
+        if _ATTR_TAG_RE.search(span):
+            out.add(d["name"])
+            continue
+        # A declaration an `attribute` command generates, whose range is the
+        # command itself: `attribute [reassoc (attr := simp)] pD_idem` adds
+        # `pD_idem_assoc`. Dropping it deleted the command, and with it the
+        # simp attribute on `pD_idem` (PALOMAR-2026-10-16-000006).
+        payloads = _attribute_command_payloads(span)
+        if payloads and not all(_is_prefix_attribute(payload) for payload in payloads):
             out.add(d["name"])
             continue
         # Plus a standalone, possibly multiline `@[...]` block directly
@@ -539,16 +587,26 @@ def detect_attribute_command_roots(
 
     out: set[str] = set()
     for text in originals.values():
-        for payload in _attribute_command_payloads(text):
+        namespaces, opens = _source_namespace_resolution_contexts(text)
+        for line_no, payload in _attribute_command_payloads_with_lines(text):
             if _is_prefix_attribute(payload):
                 continue
+            namespace = namespaces.get(line_no, "")
             for tok in _IDENT_RE.findall(payload):
-                if tok in name_set:
-                    out.add(tok)
-                else:
-                    candidates = by_last.get(tok.rsplit(".", 1)[-1], [])
-                    if len(candidates) == 1:
-                        out.add(candidates[0])
+                # Lean resolves the target through the enclosing namespaces,
+                # then the opened ones; a bare-name guess comes last. Several
+                # namespaces declaring `ideleClassGroupIsMulCommutative` must not
+                # leave `attribute [local instance] ideleClassGroupIsMulCommutative`
+                # unrooted (PALOMAR-2026-09-28-000001).
+                candidates = _namespace_name_candidates(tok, namespace) + [
+                    f"{opened}.{tok}" for opened in opens.get(line_no, ())
+                ]
+                resolved = next((name for name in candidates if name in name_set), None)
+                if resolved is None:
+                    by_suffix = by_last.get(tok.rsplit(".", 1)[-1], [])
+                    resolved = by_suffix[0] if len(by_suffix) == 1 else None
+                if resolved is not None:
+                    out.add(resolved)
     return out
 
 
@@ -639,17 +697,81 @@ def detect_opaque_environment_command_roots(
 _OPEN_NAMESPACE_RE = re.compile(
     r"^[ \t]*open(?![ \t]+scoped\b)[ \t]+([^\n]+)", re.MULTILINE
 )
-_SELECTIVE_OPEN_COMMAND_RE = re.compile(
+# Batteries' `open private a b from M` (and `export private`): opens private
+# declarations of module `M` by name suffix.
+_OPEN_PRIVATE_HEAD_RE = re.compile(r"^[ \t]*(?:open|export)[ \t]+private" + _KW_END)
+_OPEN_PRIVATE_COMMAND_RE = re.compile(
+    r"^[ \t]*(?:open|export)[ \t]+private\s+(?P<ids>.*?)\s+from\s+(?P<modules>.*?)\s*\Z", re.DOTALL
+)
+# `open A B` whose namespace list may continue on deeper-indented lines
+# (PALOMAR-2026-09-13-000001).
+_OPEN_HEAD_RE = re.compile(r"^[ \t]*open" + _KW_END)
+_PLAIN_OPEN_COMMAND_RE = re.compile(
+    r"^(?P<indent>[ \t]*)open[ \t]+(?P<names>" + _LEAN_COMMAND_NAME_PATTERN
+    + r"(?:\s+" + _LEAN_COMMAND_NAME_PATTERN + r")*)\s*\Z"
+)
+# `open Foo (a b c)`, whose target list may continue over several lines.
+_SELECTIVE_OPEN_HEAD_RE = re.compile(
     r"^(?P<indent>[ \t]*)open[ \t]+(?P<namespace>"
     + _LEAN_COMMAND_NAME_PATTERN
-    + r")[ \t]+\((?P<targets>[^()\n]*)\)[ \t]*$"
+    + r")\s+\("
 )
+_SELECTIVE_OPEN_COMMAND_RE = re.compile(
+    _SELECTIVE_OPEN_HEAD_RE.pattern + r"(?P<targets>[^()]*)\)[ \t]*\Z"
+)
+# A target list longer than this is not a selective open we understand.
+_PARENTHESIZED_MAX_LINES = 64
+
+
+def _selective_open_spans(code_lines: list[str]) -> dict[int, int]:
+    """Zero-based inclusive line spans of ``open Foo (...)`` commands."""
+
+    return _parenthesized_command_spans(code_lines, _SELECTIVE_OPEN_HEAD_RE)
+
+
+def _parenthesized_command_spans(
+    code_lines: list[str], head_re: re.Pattern[str]
+) -> dict[int, int]:
+    """Spans of commands whose head (matched by ``head_re``, ending at ``(``)
+    opens a target list that closes on the same or a later line.
+
+    The closing parenthesis may sit on its own unindented line, which the
+    indentation-based ``_continued_command_spans`` would cut off.
+    """
+
+    spans: dict[int, int] = {}
+    for start, line in enumerate(code_lines):
+        head, first = head_re.match(line), start
+        if head is None:
+            # The list may open on the next line: `open Foo` then `  (a b …)`
+            # (PALOMAR-2026-10-11-000001).
+            following = code_lines[start + 1] if start + 1 < len(code_lines) else ""
+            if not following.lstrip().startswith("("):
+                continue
+            head = head_re.match(line + "\n" + following)
+            if head is None:
+                continue
+            first = start + 1
+            line = following[following.index("(") + 1:]
+        else:
+            line = line[head.end():]
+        rest = [line, *code_lines[first + 1 : first + _PARENTHESIZED_MAX_LINES]]
+        for offset, text in enumerate(rest):
+            if "(" in text:
+                break
+            if ")" in text:
+                spans[start] = first + offset
+                break
+    return spans
 _NAMESPACE_SCOPE_RE = re.compile(
     r"^[ \t]*(?:public[ \t]+|private[ \t]+)?namespace[ \t]+"
     rf"({_LEAN_COMMAND_NAME_PATTERN})[ \t]*$"
 )
+# `section`, `noncomputable section`, `@[expose] public section`, `mutual`: each
+# is closed by an `end` that must not pop the enclosing namespace.
 _NON_NAMESPACE_SCOPE_RE = re.compile(
-    r"^[ \t]*(?:public[ \t]+|private[ \t]+)?(?:section|mutual)" + _KW_END
+    r"^[ \t]*(?:@\[[^\]]*\][ \t]*)*"
+    r"(?:(?:public|private|noncomputable)[ \t]+)*(?:section|mutual)" + _KW_END
 )
 _SCOPE_END_RE = re.compile(r"^[ \t]*end(?:[ \t]+[^\s]+)?[ \t]*$")
 
@@ -670,7 +792,7 @@ def _namespace_name_candidates(token: str, lexical_namespace: str) -> list[str]:
 
 
 def _source_namespace_resolution_contexts(
-    file_text: str,
+    file_text: str, *, strict: bool = False,
 ) -> tuple[dict[int, str], dict[int, tuple[str, ...]]]:
     """Return lexical namespace and persistent ``open`` context per line.
 
@@ -678,6 +800,10 @@ def _source_namespace_resolution_contexts(
     arbitrary dotted substrings: such a guess would treat Mathlib's top-level
     ``Topology`` namespace as project-local merely because a project
     declaration lives below ``ForMathlib.Topology``.
+
+    By default an ``open Foo (a)`` or ``open Foo hiding b`` counts as opening
+    ``Foo``, which errs towards finding references (keeping more). ``strict``
+    counts only plain ``open Foo``, for decisions to remove something.
     """
 
     code_lines = _mask_comments_preserve_layout(file_text).split("\n")
@@ -709,13 +835,26 @@ def _source_namespace_resolution_contexts(
         open_command = _OPEN_NAMESPACE_RE.match(code_line)
         if not open_command:
             continue
-        selective = _SELECTIVE_OPEN_COMMAND_RE.match(code_line)
+        following = code_lines[line_no] if line_no < len(code_lines) else ""
+        selective = _SELECTIVE_OPEN_HEAD_RE.match(code_line) or (
+            _SELECTIVE_OPEN_HEAD_RE.match(code_line + "\n" + following)
+            if following.lstrip().startswith("(") else None
+        )
+        payload = open_command.group(1)
+        if not selective:
+            indent = len(code_line) - len(code_line.lstrip())
+            for following in code_lines[line_no:]:
+                if not following.strip() or len(following) - len(following.lstrip()) <= indent:
+                    break
+                payload += " " + following
         tokens = (
             [selective.group("namespace")]
             if selective
-            else _IDENT_RE.findall(open_command.group(1))
+            else _IDENT_RE.findall(payload)
         )
-        if "in" in tokens:
+        if "in" in tokens or tokens[:1] == ["private"]:
+            continue
+        if strict and (selective or "hiding" in tokens or "renaming" in tokens):
             continue
         for token in tokens:
             for candidate in _namespace_name_candidates(token, namespace):
@@ -740,6 +879,33 @@ def _resolve_project_namespace_members(
     return set()
 
 
+@functools.lru_cache(maxsize=4)
+def _namespace_members(project_declarations: frozenset[str]) -> dict[str, frozenset[str]]:
+    """Project declarations under each namespace, by every enclosing namespace.
+
+    Private declarations still create and inhabit their source namespace, so
+    they are indexed by their user name but listed by their kernel name: the
+    keep-set intersections need the exact identities.
+    """
+
+    index: dict[str, set[str]] = {}
+    for name in project_declarations:
+        _owner, source_name = _private_owner_and_display(name)
+        parts = source_name.split(".")
+        for length in range(1, len(parts)):
+            index.setdefault(".".join(parts[:length]), set()).add(name)
+    return {namespace: frozenset(names) for namespace, names in index.items()}
+
+
+def _namespace_candidates_in_scope(
+    namespace: str, lexical_namespace: str, opened_namespaces: tuple[str, ...],
+) -> list[str]:
+    candidates = _namespace_name_candidates(namespace, lexical_namespace)
+    if not namespace.startswith("_root_."):
+        candidates += [f"{opened}.{namespace}" for opened in opened_namespaces]
+    return list(dict.fromkeys(candidates))
+
+
 def _resolve_namespace_provenance(
     namespace: str,
     project_declarations: set[str],
@@ -747,44 +913,67 @@ def _resolve_namespace_provenance(
     lexical_namespace: str,
     opened_namespaces: tuple[str, ...] = (),
 ) -> tuple[set[str], bool]:
-    """Resolve the first namespace candidate known to the built environment.
+    """Resolve every namespace an ``open`` of ``namespace`` brings into scope.
+
+    Lean opens all existing candidates: each enclosing-namespace prefix and each
+    already opened namespace. The project members of all of them are returned,
+    so an ``open`` is dead only when none of its candidates keeps a member;
+    taking just the nearest candidate deleted
+    ``open HilbertRamification.ValuationSubring`` whose live target was reached
+    through an earlier ``open RamificationTheory`` (PALOMAR-2026-10-06-000009).
 
     A namespace may contain both project declarations and imported declarations.
     Such mixed namespaces remain semantically imported even after every project
-    extension is stripped, so an `open` for them must survive. A namespace is
-    removable only when its resolved candidate has project members and no
-    imported declaration provenance.
+    extension is stripped, so an ``open`` for them must survive: ``imported`` is
+    true when any candidate has imported provenance.
     """
 
-    first_members: set[str] = set()
+    index = _namespace_members(frozenset(project_declarations))
+    members: set[str] = set()
     imported = False
-    # Private declarations still create and inhabit their source namespace.
-    # Match that namespace using the user name, but return the original kernel
-    # names so visibility/keep-set intersections retain their exact identities.
-    source_names: dict[str, str] = {}
-    for name in project_declarations:
-        _owner, source_names[name] = _private_owner_and_display(name)
-    candidates = _namespace_name_candidates(namespace, lexical_namespace)
-    if not namespace.startswith("_root_."):
-        candidates += [f"{opened}.{namespace}" for opened in opened_namespaces]
-    for candidate in dict.fromkeys(candidates):
-        prefix = candidate + "."
-        members = {
-            name for name, source_name in source_names.items()
-            if source_name.startswith(prefix)
-        }
-        if members and not first_members:
-            first_members = members
+    for candidate in _namespace_candidates_in_scope(namespace, lexical_namespace, opened_namespaces):
+        members |= index.get(candidate, frozenset())
         imported = imported or candidate in imported_namespaces
-        if members and imported:
-            break
-    # Source-order information is unavailable here. A later project namespace
-    # may share the short name of an imported namespace that already existed at
-    # this command (for example a later nested ``namespace PowerSeries`` after
-    # ``open PowerSeries``). Never delete that valid imported open merely
-    # because the later project namespace is dead. This retains no declaration;
-    # it only preserves an otherwise valid source command.
-    return first_members, imported
+    return members, imported
+
+
+def _existing_namespaces(
+    namespace: str,
+    project_declarations: set[str],
+    imported_namespaces: set[str],
+    lexical_namespace: str,
+    opened_namespaces: tuple[str, ...],
+) -> list[str]:
+    """The namespaces ``open namespace`` opens: the candidates that exist."""
+
+    index = _namespace_members(frozenset(project_declarations))
+    return [
+        candidate
+        for candidate in _namespace_candidates_in_scope(namespace, lexical_namespace, opened_namespaces)
+        if candidate in index or candidate in imported_namespaces
+    ]
+
+
+def export_alias_namespaces(originals: dict[str, str]) -> set[str]:
+    """Namespaces an ``export`` command adds aliases to, and their prefixes.
+
+    Aliases are not declarations, so a namespace holding only aliases looks
+    empty to the declaration graph; an ``open`` of it is still live
+    (PALOMAR-2026-09-17-000001 re-exports `TauCeti.ApproximationNumber` into
+    `TauCeti.DavisKahan.ExactSinTheta` and opens that).
+    """
+
+    namespaces: set[str] = set()
+    for text in originals.values():
+        if "export" not in text:
+            continue
+        code_lines = _mask_comments_preserve_layout(text).split("\n")
+        namespace_by_line, _opens = _source_namespace_resolution_contexts(text)
+        for line_no, code_line in enumerate(code_lines, 1):
+            if _EXPORT_COMMAND_HEAD_RE.match(code_line):
+                parts = namespace_by_line.get(line_no, "").split(".")
+                namespaces |= {".".join(parts[:end]) for end in range(1, len(parts) + 1) if parts[0]}
+    return namespaces
 
 
 _OPEN_HIDING_RE = re.compile(
@@ -831,6 +1020,88 @@ def detect_open_hiding_roots(
     return roots
 
 
+_OPEN_RENAMING_RE = re.compile(
+    r"^[ \t]*open[ \t]+(\S+)[ \t]+renaming[ \t]+([^\n]*)$", re.MULTILINE
+)
+_RENAMING_PAIR_RE = re.compile(rf"({_LEAN_COMMAND_NAME_PATTERN})\s*(?:→|->)")
+
+
+def detect_open_renaming_roots(
+    decls: list[DeclRange], originals: dict[str, str]
+) -> set[str]:
+    """Return declarations named by an ``open X renaming a → b`` clause.
+
+    Like ``hiding``, the clause sits outside every declaration's range, and
+    deleting ``X.a`` makes Lean reject the whole ``open``, so every later use
+    of ``b`` fails too: PALOMAR-2026-10-13-000010 renames dozens of
+    declarations this way (``open _root_.Foo renaming bar → bar``). ``X`` is
+    resolved through the enclosing namespaces as Lean resolves it.
+    """
+
+    names = {d["name"] for d in decls}
+    roots: set[str] = set()
+    for text in originals.values():
+        masked = _mask_comments_preserve_layout(text)
+        namespace_by_line = _source_namespace_resolution_contexts(text)[0]
+        for match in _OPEN_RENAMING_RE.finditer(masked):
+            namespace, pairs = match.group(1), match.group(2)
+            line = masked.count("\n", 0, match.start()) + 1
+            prefixes = _namespace_name_candidates(namespace, namespace_by_line.get(line, ""))
+            for pair in _RENAMING_PAIR_RE.finditer(pairs):
+                hit = next((f"{prefix}.{pair.group(1)}" for prefix in prefixes
+                            if f"{prefix}.{pair.group(1)}" in names), None)
+                if hit is not None:
+                    roots.add(hit)
+    return roots
+
+
+# `run_cmd`/`run_elab`/`run_meta` run code at elaboration time, often an axiom
+# audit over a list of quoted theorem names (PALOMAR-2026-10-10-000001). The
+# command has no declaration range, so its quoted names give no edge; deleting
+# one makes ``X fail with "Unknown constant". The command runs to the next
+# unindented line.
+_RUN_COMMAND_RE = re.compile(rf"^(?:run_cmd|run_elab|run_meta){_KW_END}")
+# A name the command's code names: quoted (`` `X ``, ``` ``X ```) or called
+# directly (PALOMAR-2026-10-11-000009 runs `_root_.Proj.EventTransport.run`,
+# which re-issues declarations the paper needs). Not a field after `.`.
+_RUN_COMMAND_NAME_RE = re.compile(rf"(?<![{_ID_REST}`.])(``?)?({_LEAN_COMMAND_NAME_PATTERN})")
+
+
+def detect_run_command_roots(
+    decls: list[DeclRange], originals: dict[str, str]
+) -> set[str]:
+    """Return project declarations named in top-level ``run_cmd`` commands."""
+
+    names = {d["name"] for d in decls}
+    roots: set[str] = set()
+    for text in originals.values():
+        code_lines = _mask_comments_preserve_layout(text).split("\n")
+        namespace_by_line = None
+        index = 0
+        while index < len(code_lines):
+            if not _RUN_COMMAND_RE.match(code_lines[index]):
+                index += 1
+                continue
+            if namespace_by_line is None:
+                namespace_by_line = _source_namespace_resolution_contexts(text)[0]
+            start = index
+            index += 1
+            while index < len(code_lines) and (
+                    not code_lines[index].strip() or code_lines[index][0] in " \t"):
+                index += 1
+            for offset, line in enumerate(code_lines[start:index]):
+                for quoted in _RUN_COMMAND_NAME_RE.finditer(line):
+                    name = quoted.group(2)
+                    candidates = (
+                        [name.removeprefix("_root_.")] if quoted.group(1) == "`"
+                        else _namespace_name_candidates(name, namespace_by_line.get(start + offset + 1, ""))
+                    )
+                    hit = next((c for c in candidates if c in names), None)
+                    if hit is not None:
+                        roots.add(hit)
+    return roots
+
+
 def detect_open_namespace_roots(
     decls: list[DeclRange], originals: dict[str, str]
 ) -> set[str]:
@@ -847,7 +1118,7 @@ def detect_open_namespace_roots(
         masked = _mask_comments_preserve_layout(text)
         namespace_contexts, _ = _source_namespace_resolution_contexts(text)
         for match in _OPEN_NAMESPACE_RE.finditer(masked):
-            selective = _SELECTIVE_OPEN_COMMAND_RE.match(match.group(0))
+            selective = _SELECTIVE_OPEN_HEAD_RE.match(match.group(0))
             tokens = (
                 [selective.group("namespace")]
                 if selective
@@ -871,24 +1142,39 @@ def detect_open_namespace_roots(
 # declaration owner. Detect the unambiguous textual form (a dotted declaration
 # name) for diagnostics; module import closure, rather than whole-file rooting,
 # decides whether either provider is live.
-_QUALIFIED_DECL_HEADER_RE = re.compile(
+_DECL_HEADER_RE = re.compile(
     r"^[ \t]*(?:@\[[^\]]*\][ \t]*)*"
-    r"(?:(?:public|private|protected|noncomputable|local|scoped|unsafe|partial)"
-    r"[ \t]+)*(?:def|theorem|lemma|abbrev|opaque|axiom)\s+"
-    rf"(?:_root_\.)?([{_ID_FIRST}][{_ID_REST}]*(?:\.[{_ID_FIRST}][{_ID_REST}]*)+)",
+    r"(?P<modifiers>(?:(?:public|private|protected|noncomputable|local|scoped|unsafe|partial|nonrec)"
+    r"[ \t]+)*)(?:class[ \t]+inductive|def|theorem|lemma|abbrev|opaque|axiom|instance|structure|class|inductive)\s+"
+    rf"(?P<name>(?:_root_\.)?[{_ID_FIRST}][{_ID_REST}]*(?:\.[{_ID_FIRST}][{_ID_REST}]*)*)",
     re.MULTILINE,
 )
 
 
-def detect_duplicate_qualified_declaration_files(
-    originals: dict[str, str],
-) -> set[str]:
-    """Return every file in a duplicate fully-qualified provider collision."""
+def detect_duplicate_declaration_files(originals: dict[str, str]) -> set[str]:
+    """Return every file declaring a full name that another project file declares too.
+
+    Two modules that are never imported together may both declare
+    ``NumberField.foo`` (PALOMAR-2026-09-30-000031). The dependency graph loads
+    every project module into one environment, which holds only one of them,
+    so the other copy is invisible to it and must not be stripped blindly.
+    Full names follow the enclosing ``namespace``; ``private`` declarations are
+    module-local in Lean and never collide.
+    """
+
     providers: dict[str, set[str]] = {}
     for path, text in originals.items():
         masked = _mask_comments_preserve_layout(text)
-        for match in _QUALIFIED_DECL_HEADER_RE.finditer(masked):
-            providers.setdefault(match.group(1), set()).add(path)
+        namespaces, _opens = _source_namespace_resolution_contexts(text)
+        for match in _DECL_HEADER_RE.finditer(masked):
+            if "private" in match.group("modifiers").split():
+                continue
+            name = match.group("name")
+            line_no = masked.count("\n", 0, match.start()) + 1
+            namespace = namespaces.get(line_no, "")
+            full = (name.removeprefix("_root_.") if name.startswith("_root_.") or not namespace
+                    else f"{namespace}.{name}")
+            providers.setdefault(full, set()).add(path)
     return {
         path
         for paths in providers.values() if len(paths) > 1
@@ -933,6 +1219,19 @@ def detect_structural_range_files(
     return out
 
 
+def file_text_references(text: str, declarations: set[str]) -> set[str]:
+    """Project declarations a whole file names, resolved as Lean would (see
+    ``resolve_candidates``); used to root everything a verbatim file needs."""
+
+    namespaces, opens = _source_namespace_resolution_contexts(text)
+    found: set[str] = set()
+    for line_no, line in enumerate(_mask_comments_preserve_layout(text).split("\n"), 1):
+        for token in _IDENT_RE.findall(line):
+            found |= resolve_candidates(token, declarations, namespaces.get(line_no, ""),
+                                        opens.get(line_no, ()))
+    return found
+
+
 def plan_source_retention(
     decls: list[DeclRange],
     originals: dict[str, str],
@@ -942,10 +1241,10 @@ def plan_source_retention(
     """Return the source-retention policy.
 
     Source-contract files are retained byte-for-byte and seed every declaration
-    they own. Environment commands remain in the stripped source and root their
-    declaration-level dependencies. Structural-range and duplicate-name
-    collisions are reported for auditing, but the line-safe stripper handles
-    them without whole-file declaration roots.
+    they own; so are files providing a duplicated full name. Environment
+    commands remain in the stripped source and root their declaration-level
+    dependencies. Structural-range collisions are reported for auditing; the
+    line-safe stripper handles them without whole-file declaration roots.
     """
 
     retain_exact_files = set(retain_exact_files or ())
@@ -979,10 +1278,22 @@ def plan_source_retention(
     structural_range_files = detect_structural_range_files(
         decls, originals, mod_path
     )
-    duplicate_provider_files = detect_duplicate_qualified_declaration_files(
-        originals
-    )
+    # The graph sees only one copy of a duplicated full name: keep every
+    # providing file verbatim and seed its declarations.
+    duplicate_provider_files = detect_duplicate_declaration_files(originals)
+    mapped_files = set(mod_path.values())
+    retain_exact_files |= duplicate_provider_files & mapped_files
+    retained_modules |= {
+        module for module, path in mod_path.items() if path in duplicate_provider_files
+    }
 
+    # A file kept verbatim keeps everything it names, not only what it
+    # declares: its anonymous examples and commands use other files'
+    # declarations too (PALOMAR-2026-09-29-000002).
+    names = {str(decl["name"]) for decl in decls}
+    referenced = set().union(*(
+        file_text_references(originals[path], names) for path in sorted(retain_exact_files)
+    )) if retain_exact_files else set()
     return {
         "retain_exact_files": retain_exact_files,
         "retain_exact_modules": retained_modules,
@@ -990,7 +1301,7 @@ def plan_source_retention(
             decl["name"]
             for decl in decls
             if decl["module"] in retained_modules
-        },
+        } | referenced,
         "preserve_command_files": environment_command_files,
         "environment_command_roots": (
             attribute_command_roots | opaque_environment_roots
@@ -1024,9 +1335,8 @@ def detect_force_keep_kinds(
 
     Detected from the declaration's source header (keyword behind any
     attributes/modifiers), plus the `@[instance] def` attribute form.
-    NOTE: `deriving`-generated anonymous instances, whose range points at the
-    host type's `deriving` clause, are not matched here — escalate to a
-    Lean-side instance flag if one surfaces."""
+    A standalone `deriving instance C for T` command counts as an instance; a
+    `deriving` clause on a type is part of that type's range and goes with it."""
     out: set[str] = set()
     for d in decls:
         if d["start_line"] is None:
@@ -1038,6 +1348,11 @@ def detect_force_keep_kinds(
         start, end = int(d["start_line"]), min(len(lines), int(d["end_line"]))
         span = "\n".join(lines[start - 1:end])
         if _KIND_KW_RE.search(span) or _INSTANCE_ATTR_RE.search(span):
+            out.add(d["name"])
+        elif ".Simps." in "." + str(d["name"]):
+            # Custom `@[simps]` projections (`Foo.Simps.apply`) are found by
+            # name when `initialize_simps_projections Foo` runs; dropping one
+            # silently changes every lemma `@[simps]` generates for `Foo`.
             out.add(d["name"])
     return out
 
@@ -1056,7 +1371,9 @@ def collect_implicit_dependency_roots(
     return {
         "attributed": detect_automation_tagged(decls, originals, mod_path),
         "implicit_kinds": detect_force_keep_kinds(decls, originals, mod_path)
-        | detect_open_hiding_roots(decls, originals),
+        | detect_open_hiding_roots(decls, originals)
+        | detect_open_renaming_roots(decls, originals)
+        | detect_run_command_roots(decls, originals),
         "open_namespace_candidates": detect_open_namespace_roots(
             decls, originals
         ),
@@ -1138,27 +1455,39 @@ def module_to_relpath(module: str) -> str:
 
 
 def resolve_module_paths(
-    modules: Iterable[str], original_paths: Iterable[str]
+    modules: Iterable[str],
+    original_paths: Iterable[str],
+    source_dirs: Iterable[str] | None = None,
 ) -> dict[str, str]:
-    """Map each module name to its actual source file path.
+    """Map each module name to its source file path.
 
-    The source root varies by repo: some have files at `/testbed/<Mod>/...`,
-    others under `/testbed/src/<Mod>/...`. So we don't assume a layout — we index
-    every path by its `/`-separated suffixes and look up the module's
-    fully-qualified relpath (e.g. `Foo/Bar/Baz.lean`), which is specific
-    enough to be unambiguous. Modules with no matching file are omitted.
+    With ``source_dirs`` (the project's ``LEAN_SRC_PATH`` entries, in order) a
+    module resolves as Lean resolves it: to the first of those directories
+    holding its file among ``original_paths`` (the project's sources). Without them, a module resolves only when exactly one path ends in its
+    relative path; a repository with both `Solution.lean` and
+    `Paper/Solution.lean` (PALOMAR-2026-09-28-000004) must not guess. Modules
+    with no (unambiguous) file are omitted.
     """
-    suffix: dict[str, str] = {}
-    for p in original_paths:
+    paths = list(original_paths)
+    out: dict[str, str] = {}
+    if source_dirs is not None:
+        known = set(paths)
+        directories = [directory.rstrip("/") + "/" for directory in source_dirs]
+        for m in modules:
+            rel = module_to_relpath(m)
+            hit = next((d + rel for d in directories if d + rel in known), None)
+            if hit:
+                out[m] = hit
+        return out
+    by_suffix: dict[str, list[str]] = {}
+    for p in paths:
         segs = p.split("/")
         for i in range(len(segs)):
-            suffix.setdefault("/".join(segs[i:]), p)
-    out: dict[str, str] = {}
+            by_suffix.setdefault("/".join(segs[i:]), []).append(p)
     for m in modules:
-        rel = module_to_relpath(m)
-        hit = suffix.get(rel)
-        if hit:
-            out[m] = hit
+        hits = by_suffix.get(module_to_relpath(m), [])
+        if len(hits) == 1:
+            out[m] = hits[0]
     return out
 
 
@@ -1453,15 +1782,132 @@ def strip_source(file_text: str, decl_ranges: list[DeclRange]) -> str:
 _DIAGNOSTIC_COMMAND_RE = re.compile(
     r"^[ \t]*#(?:check|print|reduce|synth)" + _KW_END + r"[^\n]*$"
 )
-_ANONYMOUS_EXAMPLE_TOKEN_RE = re.compile(r"\bexample\b")
-_SIMPLE_OPEN_COMMAND_RE = re.compile(
-    r"^(?P<indent>[ \t]*)open[ \t]+(?P<names>"
-    + _LEAN_COMMAND_NAME_PATTERN
-    + r"(?:[ \t]+"
-    + _LEAN_COMMAND_NAME_PATTERN
-    + r")*)[ \t]*$"
+# `#eval`/`#guard` run code and are kept, unless they name a deleted
+# declaration: then they cannot elaborate any more.
+_EVAL_COMMAND_RE = re.compile(r"^[ \t]*#(?:eval|guard_expr|guard)" + _KW_END)
+# A command the project itself declares, e.g. `elab "audit_axioms" n:ident : command`.
+_CUSTOM_COMMAND_DECL_RE = re.compile(
+    r'^[ \t]*(?:@\[[^\]]*\][ \t]*)*(?:(?:local|scoped|private|public)[ \t]+)*'
+    r'(?:syntax|elab|macro)(?:[ \t]*\([^)\n]*\))*[ \t]+"[ \t]*(?P<atom>[^"\s]+)[ \t]*"[^\n]*:[ \t]*command\b',
+    re.MULTILINE,
 )
+
+
+def project_command_atoms(originals: dict[str, str]) -> set[str]:
+    """Leading atoms of commands the project declares (`audit_standard_axioms`)."""
+
+    atoms: set[str] = set()
+    for text in originals.values():
+        masked = _mask_comments_preserve_layout(text)
+        atoms.update(match.group("atom") for match in _CUSTOM_COMMAND_DECL_RE.finditer(masked))
+    return atoms
+
+
+@functools.lru_cache(maxsize=8)
+def _check_command_head(custom_commands: frozenset[str]) -> re.Pattern[str]:
+    """Commands the project declares, plus `#name` and `assert_name` commands,
+    which by convention only check things (`assert_no_sorry`, `#audit_axioms`)."""
+
+    return re.compile(
+        r"^[ \t]*(?:"
+        + "".join(re.escape(atom) + "|" for atom in sorted(custom_commands, key=len, reverse=True))
+        + r"#(?!(?:guard_msgs|eval|guard_expr|guard|check|print|reduce|synth|exit)" + _KW_END + r")"
+        + _LEAN_COMMAND_NAME_PATTERN + r"|assert_" + _LEAN_COMMAND_NAME_PATTERN + r")" + _KW_END
+    )
+
+
+def _private_display_index(
+    declarations: set[str], module: str | None = None,
+) -> dict[str, set[str]]:
+    """Kernel names of private declarations, by the name source text uses.
+
+    Lean sees only the current module's private declarations; with ``module``
+    the index is limited to them.
+    """
+
+    index: dict[str, set[str]] = {}
+    for name in declarations:
+        owner, display = _private_owner_and_display(name)
+        if owner is not None and (module is None or owner == module):
+            index.setdefault(display, set()).add(name)
+    return index
+
+
+def resolve_candidates(
+    token: str, declarations: set[str], namespace: str = "",
+    opens: tuple[str, ...] = (), private_index: dict[str, set[str]] | None = None,
+    *, prefixes: bool = True,
+) -> set[str]:
+    """Every project declaration ``token`` may denote, as Lean resolves it.
+
+    Tries the token and then (with ``prefixes``) its dotted prefixes (the
+    receiver of `my_lemma.symm`), each through the enclosing namespaces and the
+    opened ones, then the current module's private names. Lean elaborates an
+    identifier with several matches as overloaded and keeps the one that
+    type-checks, so all of them are candidates: a removal needs every one of
+    them deleted (PALOMAR-2026-10-07-000001 opened three namespaces with an
+    `ownerEquiv` each, and only an unused one was deleted). Never guesses from
+    a last component: that once took Mathlib's `Semiring` in
+    `variable [Semiring B]` for a deleted project `….Semiring`
+    (PALOMAR-2026-09-14-000002).
+    """
+
+    # Universe applications tokenize `Foo.{u}` as `Foo.` and `u`.
+    parts = token.rstrip(".").split(".")
+    shortest = 1 if prefixes else len(parts)
+    for end in range(len(parts), shortest - 1, -1):
+        name = ".".join(parts[:end])
+        if name in {"", "_root_"}:
+            continue
+        candidates = _namespace_name_candidates(name, namespace)
+        if not name.startswith("_root_."):
+            candidates += [f"{opened}.{name}" for opened in opens]
+        hits = {candidate for candidate in candidates if candidate in declarations}
+        if hits:
+            return hits
+        if private_index:
+            private: set[str] = set()
+            for display in _namespace_name_candidates(name, namespace):
+                private |= private_index.get(display, set())
+            if private:
+                return private
+    return set()
+
+
+def _names_deleted_declaration(
+    payload: str, declarations: set[str], deleted_declarations: set[str],
+    namespace: str, opens: tuple[str, ...] = (),
+    private_index: dict[str, set[str]] | None = None,
+) -> bool:
+    """Whether an identifier in ``payload`` resolves exactly to a deleted declaration."""
+
+    for token in _global_identifiers(payload):
+        candidates = resolve_candidates(token, declarations, namespace, opens, private_index)
+        if candidates and candidates <= deleted_declarations:
+            return True
+    return False
+
+
+def _global_identifiers(text: str) -> Iterator[str]:
+    """The identifiers in ``text`` that can name a global declaration.
+
+    Not one right after a `.`: `(e).below` and `.inl c` are a field and a
+    constructor of a type, which a declaration called `below` or `inl` does
+    not affect (PALOMAR-2026-10-07-000001 lost `variable (hmatch …)` to a
+    deleted `below`).
+    """
+
+    for match in _IDENT_RE.finditer(text):
+        if match.start() == 0 or text[match.start() - 1] != ".":
+            yield match.group(0)
+
+
+_ANONYMOUS_EXAMPLE_TOKEN_RE = re.compile(r"\bexample\b")
 _EXPORT_COMMAND_HEAD_RE = re.compile(r"^[ \t]*export" + _KW_END)
+# `export Foo (a b c)`, whose target list may continue over several lines.
+_EXPORT_OPEN_RE = re.compile(
+    r"^[ \t]*export[ \t]+" + _LEAN_COMMAND_NAME_PATTERN + r"\s*\("
+)
 _EXPORT_COMMAND_RE = re.compile(
     r"^[ \t]*export\s+(?P<namespace>"
     + _LEAN_COMMAND_NAME_PATTERN
@@ -1533,27 +1979,32 @@ def _remove_text_spans(
     return out
 
 
-def _resolved_project_references(
+def _deleted_references(
     text: str,
     project_declarations: set[str],
+    deleted_declarations: set[str],
     *,
     local_names: set[str] | None = None,
     lexical_namespace: str = "",
-) -> set[str]:
+    opens: tuple[str, ...] = (),
+    private_index: dict[str, set[str]] | None = None,
+) -> tuple[bool, bool]:
+    """Whether a name in ``text`` denotes only deleted declarations, and whether
+    one denotes a deleted declaration among others (see ``resolve_candidates``)."""
+
     local_names = local_names or set()
-    references: set[str] = set()
-    for token in _IDENT_RE.findall(text):
-        head = token.removeprefix("_root_.").split(".", 1)[0]
-        if head in local_names:
+    only_deleted = some_deleted = False
+    for token in _global_identifiers(text):
+        if token.removeprefix("_root_.").split(".", 1)[0] in local_names:
             continue
-        resolved = _resolve_project_identifier(
-            token,
-            project_declarations,
-            lexical_namespace,
+        candidates = resolve_candidates(
+            token, project_declarations, lexical_namespace, opens, private_index
         )
-        if resolved is not None:
-            references.add(resolved)
-    return references
+        if candidates and candidates <= deleted_declarations:
+            only_deleted = True
+        elif candidates & deleted_declarations:
+            some_deleted = True
+    return only_deleted, some_deleted
 
 
 def _outer_binder_spans(
@@ -1605,11 +2056,47 @@ def _binder_dependency_text(masked_binder: str) -> str:
     return ""
 
 
+def _prune_open_private_command(
+    command: str, project_declarations: set[str], deleted_declarations: set[str],
+) -> str | None:
+    """``open private ids from M`` without the ids whose declarations were all deleted.
+
+    Batteries matches an id against the private declarations of ``M`` by name
+    suffix and fails on one that matches nothing, so an id stays while any of
+    its matches survives (PALOMAR-2026-10-08-000003 opened a private lemma the
+    strip removed). None: unchanged; "": nothing left.
+    """
+
+    masked = _mask_comments_preserve_layout(command, mask_strings=True)
+    parsed = _OPEN_PRIVATE_COMMAND_RE.match(masked)
+    if parsed is None or re.search(r"\bin\b", parsed.group("ids")):
+        return None  # the `in declarations` form names declarations, not modules
+    prefixes = tuple(f"_private.{module}.0." for module in _IDENT_RE.findall(parsed.group("modules")))
+    private = [name for name in project_declarations if name.startswith(prefixes)]
+    removals: list[tuple[int, int]] = []
+    kept = 0
+    for match in _IDENT_RE.finditer(parsed.group("ids")):
+        parts = match.group(0).split(".")
+        matches = {name for name in private if name.split(".")[-len(parts):] == parts}
+        if matches and matches <= deleted_declarations:
+            start = parsed.start("ids") + match.start()
+            removals.append((start, parsed.start("ids") + match.end()))
+        else:
+            kept += 1
+    if not removals:
+        return None
+    if not kept:
+        return ""
+    return "\n".join(line.rstrip() for line in _remove_text_spans(command, removals).split("\n"))
+
+
 def _prune_attribute_command(
     command: str,
     project_declarations: set[str],
     deleted_declarations: set[str],
     lexical_namespace: str,
+    opens: tuple[str, ...] = (),
+    private_index: dict[str, set[str]] | None = None,
 ) -> tuple[str, int]:
     masked = _mask_comments_preserve_layout(command, mask_strings=True)
     head = _ATTRIBUTE_COMMAND_HEAD_RE.match(masked)
@@ -1621,12 +2108,12 @@ def _prune_attribute_command(
         token = match.group(0)
         if token == "in" and not payload[match.end() :].strip():
             continue
-        resolved = _resolve_project_identifier(
-            token,
-            project_declarations,
-            lexical_namespace,
+        # An attribute target names a constant itself, never a receiver.
+        candidates = resolve_candidates(
+            token, project_declarations, lexical_namespace, opens, private_index,
+            prefixes=False,
         )
-        if resolved in deleted_declarations:
+        if candidates and candidates <= deleted_declarations:
             removals.append(
                 (head.end() + match.start(), head.end() + match.end())
             )
@@ -1708,7 +2195,22 @@ def _prune_variable_command(
     live_variable_names: set[str],
     dead_variable_names: set[str],
     lexical_namespace: str,
+    opens: tuple[str, ...] = (),
+    private_index: dict[str, set[str]] | None = None,
+    mentioned_names: set[str] | None = None,
 ) -> tuple[str, set[str], set[str], int]:
+    """``command`` without the binders that cannot elaborate after the strip.
+
+    A binder goes when a name in its type denotes only deleted declarations,
+    or a variable already gone. A name that also denotes a kept declaration
+    (Lean elaborates it as overloaded) is decided by use: a binder some kept
+    code still mentions stays, since that code keeps the declaration Lean
+    picked (PALOMAR-2026-10-07-000001's `hmatch`); an unused one goes, as Lean
+    could take the surviving candidate and fail (PALOMAR-2026-08-27-000009's
+    `hW : IsCanonical k K W`, whose `FunctionField.IsCanonical` was deleted
+    while `Chart.IsCanonical` survived).
+    """
+
     masked = _mask_comments_preserve_layout(command, mask_strings=True)
     head = _VARIABLE_COMMAND_HEAD_RE.match(masked)
     if head is None:
@@ -1728,13 +2230,17 @@ def _prune_variable_command(
             in dead_variable_names
             for token in dependency_tokens
         )
-        references = _resolved_project_references(
+        only_deleted, some_deleted = _deleted_references(
             dependencies,
             project_declarations,
+            deleted_declarations,
             local_names=locally_live,
             lexical_namespace=lexical_namespace,
+            opens=opens,
+            private_index=private_index,
         )
-        if references_dead_variable or references & deleted_declarations:
+        unused = not (names & (mentioned_names or set()))
+        if references_dead_variable or only_deleted or (some_deleted and unused):
             removals.append((start, end))
             removed_names.update(names)
         else:
@@ -1789,24 +2295,6 @@ def _prune_include_omit_command(
 
 
 
-def _resolve_project_identifier(
-    token: str,
-    declarations: set[str],
-    lexical_namespace: str = "",
-) -> str | None:
-    # Universe applications tokenize `Foo.{u}` as `Foo.` and `u`.
-    token = token.removeprefix("_root_.").rstrip(".")
-    for candidate in _namespace_name_candidates(token, lexical_namespace):
-        if candidate in declarations:
-            return candidate
-    candidates = {
-        name
-        for name in declarations
-        if name.endswith("." + token)
-    }
-    return next(iter(candidates)) if len(candidates) == 1 else None
-
-
 # Per-kind counters reported by `remove_dead_commands`, in report order.
 _DEAD_COMMAND_STAT_KEYS = (
     "diagnostics_removed",
@@ -1821,23 +2309,31 @@ _DEAD_COMMAND_STAT_KEYS = (
     "variable_binders_removed",
     "include_omit_commands_removed",
     "include_omit_names_removed",
+    "evals_removed",
+    "custom_commands_removed",
 )
 
 
 def remove_dead_commands(
     file_text: str,
-    project_declarations: set[str],
+    project_declarations: Iterable[str],
     kept_declarations: set[str],
     imported_namespaces: set[str] | None = None,
     *,
     visible_kept_declarations: set[str] | None = None,
+    custom_commands: set[str] | None = None,
+    module: str | None = None,
+    visible_declarations: set[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """Remove non-semantic diagnostics and commands with deleted targets.
 
     ``#check``, ``#print``, ``#reduce``, and ``#synth`` only query or print
     elaborated information. They do not add declarations or mutate the
     environment, so they are always removed regardless of target.
-    ``#eval`` is deliberately retained because it may execute arbitrary IO.
+    ``#eval``/``#guard`` are retained because they may execute arbitrary IO,
+    unless they name a deleted project declaration and so cannot elaborate.
+    The same holds for commands the project declares itself (``custom_commands``,
+    their leading atoms, e.g. ``audit_standard_axioms Foo.thm``).
     Bare ``open`` entries resolving exactly to an exclusively project-owned
     namespace with no live declarations are pruned. Imported and mixed
     namespaces, scoped opens, prefixes, and ambiguous opens remain because they
@@ -1860,6 +2356,14 @@ def remove_dead_commands(
         else visible_kept_declarations
     )
     deleted_declarations = project_declarations - kept_declarations
+    # Removal decisions resolve names exactly: only declarations this file can
+    # see, only its own private names, only namespaces opened whole.
+    # Frozen once: the namespace index is cached by it (a frozenset of a
+    # frozenset is the same object, so callers that freeze it pay nothing).
+    project_declarations = frozenset(project_declarations)
+    visible = project_declarations if visible_declarations is None else visible_declarations
+    private_index = _private_display_index(project_declarations, module) if module else None
+    _strict_namespaces, strict_opens = _source_namespace_resolution_contexts(file_text, strict=True)
     imported_namespaces = set(imported_namespaces or ())
     delete_lines: set[int] = set()
     replacements: dict[int, str] = {}
@@ -1877,7 +2381,18 @@ def remove_dead_commands(
     diagnostic_spans = _continued_command_spans(
         code_lines, _DIAGNOSTIC_COMMAND_RE
     )
-    export_spans = _continued_command_spans(code_lines, _EXPORT_COMMAND_HEAD_RE)
+    # PALOMAR-2026-09-18-000005 closes a long `export` list on an unindented
+    # line; the parenthesis, not the indentation, ends the command.
+    export_spans = {
+        **_continued_command_spans(code_lines, _EXPORT_COMMAND_HEAD_RE),
+        **_parenthesized_command_spans(code_lines, _EXPORT_OPEN_RE),
+    }
+    eval_spans = _continued_command_spans(code_lines, _EVAL_COMMAND_RE)
+    custom_head = _check_command_head(frozenset(custom_commands or ()))
+    custom_spans = _continued_command_spans(code_lines, custom_head)
+    selective_open_spans = _selective_open_spans(code_lines)
+    open_private_spans = _continued_command_spans(code_lines, _OPEN_PRIVATE_HEAD_RE)
+    open_spans = _continued_command_spans(code_lines, _OPEN_HEAD_RE)
     continuation_lines = {
         line
         for start, end in (
@@ -1886,11 +2401,28 @@ def remove_dead_commands(
             + list(include_omit_spans.items())
             + list(diagnostic_spans.items())
             + list(export_spans.items())
+            + list(eval_spans.items())
+            + list(custom_spans.items())
+            + list(selective_open_spans.items())
+            + list(open_private_spans.items())
+            + list(open_spans.items())
         )
         for line in range(start + 1, end + 1)
     }
     live_variable_names: set[str] = set()
     dead_variable_names: set[str] = set()
+    # Names the file uses outside `variable`/`include`/`omit`: a binder named
+    # here may be in use (a homonymous parameter only makes this cautious).
+    binder_command_lines = {
+        line
+        for start, end in list(variable_spans.items()) + list(include_omit_spans.items())
+        for line in range(start, end + 1)
+    }
+    mentioned_names = {
+        token.split(".", 1)[0]
+        for index, code_line in enumerate(code_lines) if index not in binder_command_lines
+        for token in _IDENT_RE.findall(code_line)
+    }
 
     for line_no, code_line in enumerate(code_lines, 1):
         zero_based = line_no - 1
@@ -1902,9 +2434,11 @@ def remove_dead_commands(
             command = "\n".join(lines[zero_based : end + 1])
             pruned, target_count = _prune_attribute_command(
                 command,
-                project_declarations,
+                visible,
                 deleted_declarations,
                 namespace_contexts.get(line_no, ""),
+                strict_opens.get(line_no, ()),
+                private_index,
             )
             if target_count:
                 stats["attribute_targets_removed"] += target_count
@@ -1922,11 +2456,14 @@ def remove_dead_commands(
             pruned, removed_names, surviving_names, binder_count = (
                 _prune_variable_command(
                     command,
-                    project_declarations,
+                    visible,
                     deleted_declarations,
                     live_variable_names,
                     dead_variable_names,
                     namespace_contexts.get(line_no, ""),
+                    strict_opens.get(line_no, ()),
+                    private_index,
+                    mentioned_names,
                 )
             )
             dead_variable_names.update(removed_names)
@@ -1967,8 +2504,60 @@ def remove_dead_commands(
             stats["diagnostics_removed"] += 1
             continue
 
-        selective_open = _SELECTIVE_OPEN_COMMAND_RE.match(code_line)
-        if selective_open:
+        if zero_based in custom_spans:
+            end = custom_spans[zero_based]
+            command = _mask_comments_preserve_layout(
+                "\n".join(lines[zero_based : end + 1]), mask_strings=True
+            )
+            payload = command[custom_head.match(command).end():]
+            if _names_deleted_declaration(
+                payload, visible, deleted_declarations,
+                namespace_contexts.get(line_no, ""), strict_opens.get(line_no, ()),
+                private_index,
+            ):
+                start = _extend_guarded_diagnostic_up(lines, code_lines, line_no)
+                delete_lines.update(range(start, end + 2))
+                stats["custom_commands_removed"] += 1
+            continue
+
+        if zero_based in eval_spans:
+            end = eval_spans[zero_based]
+            command = _mask_comments_preserve_layout(
+                "\n".join(lines[zero_based : end + 1]), mask_strings=True
+            )
+            payload = command[_EVAL_COMMAND_RE.match(command).end():]
+            if _names_deleted_declaration(
+                payload, visible, deleted_declarations,
+                namespace_contexts.get(line_no, ""), strict_opens.get(line_no, ()),
+                private_index,
+            ):
+                start = _extend_guarded_diagnostic_up(lines, code_lines, line_no)
+                delete_lines.update(range(start, end + 2))
+                stats["evals_removed"] += 1
+            continue
+
+        if zero_based in open_private_spans:
+            end = open_private_spans[zero_based]
+            pruned = _prune_open_private_command(
+                "\n".join(lines[zero_based : end + 1]), project_declarations, deleted_declarations,
+            )
+            if pruned is not None:
+                delete_lines.update(range(line_no + 1, end + 2))
+                if pruned:
+                    replacements[line_no] = pruned
+                else:
+                    delete_lines.add(line_no)
+                stats["open_commands_removed" if not pruned else "open_declarations_removed"] += 1
+            continue
+
+        if zero_based in selective_open_spans:
+            end = selective_open_spans[zero_based]
+            command = "\n".join(lines[zero_based : end + 1])
+            selective_open = _SELECTIVE_OPEN_COMMAND_RE.match(
+                "\n".join(code_lines[zero_based : end + 1])
+            )
+            if selective_open is None:
+                continue
             namespace = selective_open.group("namespace")
             payload = selective_open.group("targets")
             namespace_candidates = _namespace_name_candidates(
@@ -2000,42 +2589,72 @@ def remove_dead_commands(
                     remaining += 1
             if removals:
                 stats["open_declarations_removed"] += len(removals)
+                delete_lines.update(range(line_no + 1, end + 2))
                 if remaining:
-                    replacements[line_no] = _remove_text_spans(
-                        lines[zero_based], removals
-                    ).rstrip()
+                    pruned = [
+                        line.rstrip()
+                        for line in _remove_text_spans(command, removals).split("\n")
+                    ]
+                    pruned = [line for index, line in enumerate(pruned)
+                              if index == 0 or line.strip()]
+                    if len(pruned) > 1 and pruned[-1].strip() == ")":
+                        pruned[-2:] = [pruned[-2] + ")"]
+                    replacements[line_no] = "\n".join(pruned)
                 else:
                     delete_lines.add(line_no)
                     stats["open_commands_removed"] += 1
             continue
 
-        opened = _SIMPLE_OPEN_COMMAND_RE.match(code_line)
+        opened = (
+            _PLAIN_OPEN_COMMAND_RE.match("\n".join(code_lines[zero_based : open_spans[zero_based] + 1]))
+            if zero_based in open_spans else None
+        )
         if opened:
+            span_end = open_spans[zero_based]
             tokens = opened.group("names").split()
             # ``open scoped`` and ``open ... in`` have different semantics;
             # preserve them unless a complete Lean command node models them.
-            if tokens and (tokens[0] == "scoped" or tokens[-1] == "in"):
+            if tokens and (tokens[0] == "scoped" or tokens[-1] == "in"
+                           or "hiding" in tokens or "renaming" in tokens):
                 continue
-            retained: list[str] = []
-            removed = 0
+            # Lean opens the names in order, each relative to the ones before
+            # it: in `open DraismaVargas.Infrastructure GluingDatum` the second
+            # is `DraismaVargas.Infrastructure.GluingDatum`
+            # (PALOMAR-2026-10-09-000009). An earlier name a live later one
+            # is reached through stays, even if it is dead itself.
+            lexical = namespace_contexts.get(line_no, "")
+            before = tuple(open_contexts.get(line_no, ()))
+            within: list[str] = []
+            decisions: list[list] = []
             for namespace in tokens:
                 members, imported = _resolve_namespace_provenance(
-                    namespace,
-                    project_declarations,
-                    imported_namespaces,
-                    namespace_contexts.get(line_no, ""),
-                    open_contexts.get(line_no, ()),
+                    namespace, project_declarations, imported_namespaces, lexical,
+                    before + tuple(within),
                 )
-                if (
-                    members
-                    and not imported
-                    and not (members & visible_kept)
-                ):
-                    removed += 1
-                else:
-                    retained.append(namespace)
+                alone, _ = _resolve_namespace_provenance(
+                    namespace, project_declarations, imported_namespaces, lexical, before,
+                )
+                dead = bool(members) and not imported and not (members & visible_kept)
+                through_earlier = bool((members - alone) & visible_kept)
+                decisions.append([namespace, dead, through_earlier])
+                # Only namespaces that exist are opened: adding every
+                # candidate doubled `within` per name, and a 12-name `open`
+                # never finished (PALOMAR-2026-10-12-000002).
+                within += [
+                    opened for opened in _existing_namespaces(
+                        namespace, project_declarations, imported_namespaces, lexical,
+                        before + tuple(within))
+                    if opened not in within
+                ]
+            for index, (_namespace, dead, through_earlier) in enumerate(decisions):
+                if through_earlier and not dead:
+                    for earlier in decisions[:index]:
+                        earlier[1] = False
+            retained = [namespace for namespace, dead, _ in decisions if not dead]
+            removed = len(decisions) - len(retained)
             if removed:
                 stats["open_namespaces_removed"] += removed
+                delete_lines.update(range(line_no + 1, span_end + 2))
                 if retained:
                     replacements[line_no] = (
                         f"{opened.group('indent')}open {' '.join(retained)}"
@@ -2125,7 +2744,9 @@ def import_only_stub(file_text: str) -> str:
         # Match against comment/string-masked source as well: prose such as
         # "import of the downstream module" inside a module doc comment is not
         # a Lean import command and must never leak into a generated stub.
-        if code_line in {"prelude", "module"} or line_no in import_lines:
+        # `rstrip("\r")`: a CRLF file's header line is `module\r`
+        # (PALOMAR-2026-10-13-000008 lost it, and `public import` with it).
+        if code_line.rstrip("\r") in {"prelude", "module"} or line_no in import_lines:
             kept.append(line)
     return "\n".join(kept) + ("\n" if kept else "")
 
@@ -2140,12 +2761,22 @@ def plan_stripped_sources(
     anonymous_example_ranges: dict[str, list[DeclRange]] | None = None,
     all_project_declarations: set[str] | None = None,
     imported_namespaces: set[str] | None = None,
+    syntax: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Plan the complete declaration/source-command strip without I/O.
 
     Returns the desired source of every file plus a summary. The caller
     (engine.py) writes the changed files and certifies them with a build.
+
+    ``syntax`` maps paths to Lean's own analysis of the file (frontend.py).
+    A file with a usable analysis is edited from it (syntax_edit.py): command
+    spans and kinds, scopes and the constants names denote all come from
+    Lean. Every other file takes the regex path below.
     """
+
+    from lean_strip._pipeline.preprocessing import syntax_edit
+
+    syntax = syntax or {}
 
     preserved_commands = set(preserve_command_files or ())
     retained_files = set(retain_exact_files or ())
@@ -2171,22 +2802,33 @@ def plan_stripped_sources(
     desired = dict(originals)
     declaration_drop_files: set[str] = set()
     stubbed_files: list[str] = []
+    stub_paths: set[str] = set()
     command_preserved_files: list[str] = []
+    lean_files = {
+        path for path, analysis in syntax.items()
+        if path in originals and path not in retained_files
+        and syntax_edit.usable(analysis, originals[path])
+    }
+    lean_rows: dict[str, list[DeclRange]] = {}
     for path, file_rows in by_path.items():
         if path in retained_files or all(row["keep"] for row in file_rows):
             continue
         declaration_drop_files.add(path)
-        if file_has_kept_decl(file_rows):
-            desired[path] = strip_source(originals[path], file_rows)
-        elif path in preserved_commands:
-            desired[path] = strip_source(originals[path], file_rows)
-            command_preserved_files.append(path.removeprefix("/testbed/"))
+        if file_has_kept_decl(file_rows) or path in preserved_commands:
+            if path in lean_files:
+                lean_rows[path] = file_rows  # planned with the dead commands below
+            else:
+                desired[path] = strip_source(originals[path], file_rows)
+            if not file_has_kept_decl(file_rows):
+                command_preserved_files.append(path.removeprefix("/testbed/"))
         else:
-            desired[path] = import_only_stub(originals[path])
+            stub = syntax_edit.header_stub(syntax.get(path), originals[path])
+            desired[path] = stub if stub is not None else import_only_stub(originals[path])
             stubbed_files.append(module_to_relpath(file_rows[0]["module"]))
+            stub_paths.add(path)
 
-    project_declarations = set(all_project_declarations or ())
-    project_declarations.update(str(row["name"]) for row in rows)
+    project_declarations = frozenset(
+        {*(all_project_declarations or ()), *(str(row["name"]) for row in rows)})
     kept_declarations = {
         str(row["name"])
         for row in rows
@@ -2196,16 +2838,19 @@ def plan_stripped_sources(
         **dict.fromkeys(_DEAD_COMMAND_STAT_KEYS, 0),
         "files_changed": 0,
     }
-    imported = set(imported_namespaces or ())
+    imported = set(imported_namespaces or ()) | export_alias_namespaces(originals)
     # An identically named namespace in an unrelated module cannot make this
     # file's `open` valid. Scope only command cleanup to its import closure;
     # the declaration keep-set and dependency graph remain unchanged.
     import_graph, resolved_paths = build_module_import_graph(
         originals, "/testbed/", known_module_paths=module_paths
     )
+    custom_commands = project_command_atoms(originals)
     path_modules = {path: module for module, path in resolved_paths.items()}
     kept_by_module: dict[str, set[str]] = {}
+    names_by_module: dict[str, set[str]] = {}
     for row in rows:
+        names_by_module.setdefault(str(row["module"]), set()).add(str(row["name"]))
         if row["keep"]:
             kept_by_module.setdefault(str(row["module"]), set()).add(str(row["name"]))
     # Range-less/generated declarations may have no source module in this
@@ -2214,7 +2859,16 @@ def plan_stripped_sources(
         names for module, names in kept_by_module.items()
         if module not in resolved_paths
     ))
-    for path, content in desired.items():
+    lean_context = syntax_edit.Context(
+        project_declarations=project_declarations,
+        deleted=project_declarations - kept_declarations,
+        kept=kept_declarations,
+        imported_namespaces=imported,
+        custom_commands=frozenset(custom_commands),
+    )
+    lean_edited: list[str] = []
+    lean_fallback: dict[str, str] = {}
+    for path, content in list(desired.items()):
         if path in retained_files:
             continue
         module = path_modules.get(path)
@@ -2225,12 +2879,38 @@ def plan_stripped_sources(
             ))
             if module is not None else kept_declarations
         )
+        if path in lean_files and path not in stub_paths:
+            planned = syntax_edit.plan_file(
+                syntax[path], lean_rows.get(path, []), lean_context, visible_kept=visible_kept,
+            )
+            if planned is not None:
+                cleaned, cleanup = planned
+                lean_edited.append(path.removeprefix("/testbed/"))
+                # Declarations and dead commands go in one edit here; count
+                # the file as cleaned up only for the latter.
+                if any(cleanup.values()):
+                    dead_command_cleanup["files_changed"] += 1
+                desired[path] = cleaned
+                for key, value in cleanup.items():
+                    dead_command_cleanup[key] += value
+                continue
+            lean_fallback[path.removeprefix("/testbed/")] = "a dropped declaration lies in no Lean command"
+            if path in lean_rows:
+                content = desired[path] = strip_source(originals[path], lean_rows[path])
         cleaned, cleanup = remove_dead_commands(
             content,
             project_declarations,
             kept_declarations,
             imported,
             visible_kept_declarations=visible_kept,
+            custom_commands=custom_commands,
+            module=module,
+            # A file of unknown module resolves against every project name.
+            visible_declarations=(
+                set().union(*(names_by_module.get(m, set())
+                              for m in _closure(import_graph, {module})))
+                if module is not None else None
+            ),
         )
         if cleaned != content:
             dead_command_cleanup["files_changed"] += 1
@@ -2253,6 +2933,9 @@ def plan_stripped_sources(
             if example_rows
         ),
         "dead_command_cleanup": dead_command_cleanup,
+        "stub_paths": sorted(stub_paths),
+        "lean_edited_files": sorted(lean_edited),
+        "lean_fallback_files": lean_fallback,
     }
 
 
@@ -2299,6 +2982,63 @@ def derive_source_roots(mod_path: dict[str, str]) -> list[str]:
         elif path.endswith(tail):
             roots.add(path[: -len(tail)])
     return sorted(roots, key=lambda root: (-len(root), root))
+
+
+def namespace_anchor_roots(
+    originals: dict[str, str],
+    decls: list[DeclRange],
+    keep: set[str],
+    module_paths: dict[str, str],
+    imported_namespaces: set[str] | None = None,
+) -> set[str]:
+    """Declarations to keep so that every surviving `open X` still finds `X`.
+
+    Lean rejects `open X` unless namespace `X` exists at that point; a file's
+    own later declarations do not count. PALOMAR-2026-10-11-000009 imports a
+    `NamespaceAnchor` module only so that `open _root_.SubdiffusiveProcess.Section8`
+    is legal before the file defines into that namespace; the strip deleted the
+    anchor and kept the `open`, since the file's own members keep it alive.
+    So: where a file keeps members of `X` itself but none of the members its
+    imports provide survive, keep one of those.
+    """
+
+    imported = set(imported_namespaces or ())
+    import_graph, resolved = build_module_import_graph(
+        originals, "/testbed/", known_module_paths=module_paths
+    )
+    path_modules = {path: module for module, path in resolved.items()}
+    module_of: dict[str, str] = {}
+    by_namespace: dict[str, list[str]] = {}
+    for decl in decls:
+        name = str(decl["name"])
+        module_of[name] = str(decl["module"])
+        parts = name.split(".")
+        for end in range(1, len(parts)):
+            by_namespace.setdefault(".".join(parts[:end]), []).append(name)
+    anchors: set[str] = set()
+    for path, text in originals.items():
+        module = path_modules.get(path)
+        if module is None or "open" not in text:
+            continue
+        closure: set[str] | None = None
+        namespaces, _opens = _source_namespace_resolution_contexts(text)
+        for line_no, code_line in enumerate(_mask_comments_preserve_layout(text).split("\n"), 1):
+            match = _PLAIN_OPEN_COMMAND_RE.match(code_line.rstrip("\r"))
+            if match is None:
+                continue
+            for token in match.group("names").split():
+                for namespace in _namespace_name_candidates(token, namespaces.get(line_no, "")):
+                    members = by_namespace.get(namespace, [])
+                    if namespace in imported or not any(
+                        module_of[name] == module and name in keep for name in members
+                    ):
+                        continue
+                    if closure is None:
+                        closure = _closure(import_graph, {module}) - {module}
+                    provided = sorted(name for name in members if module_of[name] in closure)
+                    if provided and not any(name in keep for name in provided):
+                        anchors.add(provided[0])
+    return anchors
 
 
 def build_module_import_graph(
@@ -2528,17 +3268,19 @@ def plan_protected_module_prune(
     """
 
     entry_tail = module_to_relpath(entry_module)
-    entry_paths = [
-        path
-        for path in originals
-        if path == entry_tail or path.endswith("/" + entry_tail)
-    ]
-    if len(entry_paths) != 1:
-        raise ValueError(
-            f"expected exactly one source for entry module {entry_module!r}, "
-            f"found {entry_paths}"
-        )
-    entry_path = entry_paths[0]
+    entry_path = (known_module_paths or {}).get(entry_module)
+    if entry_path is None:
+        entry_paths = [
+            path
+            for path in originals
+            if path == entry_tail or path.endswith("/" + entry_tail)
+        ]
+        if len(entry_paths) != 1:
+            raise ValueError(
+                f"expected exactly one source for entry module {entry_module!r}, "
+                f"found {entry_paths}"
+            )
+        entry_path = entry_paths[0]
     source_root = entry_path[: -len(entry_tail)]
     graph, module_paths = build_module_import_graph(
         originals,

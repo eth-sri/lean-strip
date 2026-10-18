@@ -20,6 +20,8 @@ from collections import deque
 from pathlib import Path
 from typing import Iterable
 
+from lean_strip.lakefile import field_indent, path_dependency_dirs
+
 
 ROOT_BUILD_METADATA = {
     ".gitignore",
@@ -33,8 +35,9 @@ _SAFE_MODULE = re.compile(
     r"(?:[A-Za-z_][A-Za-z0-9_']*|«[^»\n]+»)"
     r"(?:\.(?:[A-Za-z_][A-Za-z0-9_']*|«[^»\n]+»))*"
 )
+# A declaration may be indented, e.g. under `@[default_target]` (PALOMAR-2026-09-15-000002).
 _LEAN_LIBRARY = re.compile(
-    r"(?m)^lean_lib[ \t]+(?P<name>«[^»\n]+»|[A-Za-z_][A-Za-z0-9_']*)"
+    r"(?m)^[ \t]*lean_lib[ \t]+(?P<name>«[^»\n]+»|[A-Za-z_][A-Za-z0-9_']*)"
     r"(?P<tail>[^\n]*)$"
 )
 _MODULE_COMPONENT = r"(?:[A-Za-z_][A-Za-z0-9_']*|«[^»\n]+»)"
@@ -89,9 +92,56 @@ def lake_environment(root: Path) -> dict[str, str]:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _source_search_path(root: Path, env: dict[str, str]) -> list[Path]:
+    """``LEAN_SRC_PATH`` with the project's own source directories first.
+
+    Lake assigns a module to the package whose library declares it, not to the
+    first file on the path: PALOMAR-2026-09-25-000018 imports its own `Main`,
+    and the vendored `vendor/leancert/Main.lean`, which no library declares,
+    came first. Taking it isolated the solution from the whole proof.
+    """
+
+    directories = [
+        (root / directory).resolve()
+        for directory in env.get("LEAN_SRC_PATH", "").split(os.pathsep)
+        if directory
+    ]
+    if not directories:
+        return [root]
+    resolved_root = root.resolve()
+    vendored = [path.resolve() for path in path_dependency_dirs(root)]
+
+    def own(directory: Path) -> bool:
+        return (_inside(directory, resolved_root)
+                and ".lake" not in directory.relative_to(resolved_root).parts
+                and not any(_inside(directory, package) for package in vendored))
+
+    return ([directory for directory in directories if own(directory)]
+            + [directory for directory in directories if not own(directory)])
+
+
+def _resolve_import(module: str, search: list[Path]) -> Path | None:
+    """The source file Lean reads for ``module``: the first search-path hit."""
+
+    relative = _module_to_relative_path(module)
+    for directory in search:
+        candidate = directory / relative
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def direct_local_dependencies(
     source: Path, root: Path, env: dict[str, str] | None = None
 ) -> tuple[Path, ...]:
+    """Project sources that ``source`` imports directly.
+
+    ``lean --src-deps`` maps each import's compiled module back to a source
+    path but ignores a library's ``srcDir``: it reports `Lib/Mod.lean` for
+    `Lib/Lib/Mod.lean` (PALOMAR-2026-09-18-000005). The imports are therefore
+    also resolved through the source search path, as Lean resolves them.
+    """
+
     command = (
         ["lake", "env", "lean", "--src-deps", str(source)]
         if env is None
@@ -110,6 +160,12 @@ def direct_local_dependencies(
         for line in result.stdout.splitlines()
         if (dependency := _local_source(line, root)) is not None
     }
+    if env is not None:
+        search = _source_search_path(root, env)
+        for match in _IMPORT_COMMAND.finditer(_without_lean_comments(source.read_text())):
+            resolved = _resolve_import(match.group("module"), search)
+            if resolved is not None and (local := _local_source(str(resolved), root)) is not None:
+                dependencies.add(local)
     return tuple(sorted(dependencies))
 
 
@@ -157,24 +213,24 @@ def _module_to_relative_path(module: str) -> Path:
     return Path(*components).with_suffix(".lean")
 
 
-def local_import_modules(sources: Iterable[Path], root: Path) -> tuple[str, ...]:
-    """Return exact imported module names whose sources are retained locally."""
+def local_import_modules(
+    sources: Iterable[Path], root: Path, env: dict[str, str] | None = None
+) -> tuple[str, ...]:
+    """Return exact imported module names whose sources are retained locally.
+
+    An import is resolved the way Lean resolves it: the first directory of
+    ``LEAN_SRC_PATH`` holding the module's file wins. Matching path suffixes
+    instead would take `PNT/Mathlib/Algebra/Foo.lean` for `Mathlib.Algebra.Foo`.
+    """
 
     root = root.resolve(strict=True)
     retained = {source.resolve(strict=True) for source in sources}
-    retained_relatives = tuple(
-        source.relative_to(root).as_posix() for source in retained
-    )
+    search = _source_search_path(root, env if env is not None else lake_environment(root))
     modules: set[str] = set()
     for source in retained:
-        masked = _without_lean_comments(source.read_text())
-        for match in _IMPORT_COMMAND.finditer(masked):
+        for match in _IMPORT_COMMAND.finditer(_without_lean_comments(source.read_text())):
             module = match.group("module")
-            suffix = _module_to_relative_path(module).as_posix()
-            if any(
-                relative == suffix or relative.endswith("/" + suffix)
-                for relative in retained_relatives
-            ):
+            if _resolve_import(module, search) in retained:
                 modules.add(module)
     return tuple(sorted(modules))
 
@@ -655,8 +711,8 @@ def _lean_library_candidates(
     return candidates
 
 
-def _render_lean_roots(roots: list[str]) -> str:
-    return "  roots := #[" + ", ".join(f"`{module}" for module in roots) + "]"
+def _render_lean_roots(roots: list[str], indent: str = "  ") -> str:
+    return indent + "roots := #[" + ", ".join(f"`{module}" for module in roots) + "]"
 
 
 def _rewrite_lean_library(
@@ -665,8 +721,9 @@ def _rewrite_lean_library(
     section = str(library["section"])
     replacements: list[tuple[int, int, str]] = []
     roots_span = library["roots_span"]
+    indent = field_indent(section, re.match(r"[ \t]*", section).group(0))
     if roots_span is not None:
-        replacements.append((*roots_span, _render_lean_roots(assigned_roots)))
+        replacements.append((*roots_span, _render_lean_roots(assigned_roots, indent)))
     globs_span = library["globs_span"]
     if globs_span is not None:
         start, end = globs_span
@@ -683,10 +740,38 @@ def _rewrite_lean_library(
         section = (
             section[:declaration_end]
             + "\n"
-            + _render_lean_roots(assigned_roots)
+            + _render_lean_roots(assigned_roots, indent)
             + section[declaration_end:]
         )
     return section
+
+
+_LEAN_GLOB = re.compile(
+    rf"(?:\.(?P<kind>one|submodules|andSubmodules)\s+)?`(?P<module>{_MODULE_COMPONENT}(?:\.{_MODULE_COMPONENT})*)"
+)
+
+
+def _globs_cover(library: dict[str, object], modules: list[str]) -> bool:
+    """Whether the library's `globs` already include every module in ``modules``.
+
+    Isolation deletes every file outside the closure, so such globs then match
+    exactly the kept modules and need no rewrite; spelling them out as roots
+    instead gave PALOMAR-2026-10-11-000009 an array of about 5000 modules,
+    beyond Lean's maximum recursion depth.
+    """
+
+    span = library["globs_span"]
+    if span is None:
+        return False
+    globs = [(match.group("kind") or "one", match.group("module"))
+             for match in _LEAN_GLOB.finditer(str(library["section"])[span[0]:span[1]])]
+
+    def covers(kind: str, glob: str, module: str) -> bool:
+        below = module.startswith(glob + ".")
+        return {"one": module == glob, "submodules": below,
+                "andSubmodules": module == glob or below}[kind]
+
+    return bool(globs) and all(any(covers(kind, glob, module) for kind, glob in globs) for module in modules)
 
 
 def synchronize_lakefile_lean_roots(
@@ -742,7 +827,7 @@ def synchronize_lakefile_lean_roots(
                 ),
             }
         )
-        if implicit_exact_root or (
+        if implicit_exact_root or _globs_cover(library, assigned_roots) or (
             before_roots == assigned_roots and before_globs is None
         ):
             continue
@@ -772,7 +857,7 @@ def synchronize_lakefile_lean_roots(
             module == root or module.startswith(str(root) + ".")
             for root in configured_roots
         )
-        if not covered or library["globs"] is not None:
+        if not (covered and library["globs"] is None) and not _globs_cover(library, [module]):
             raise ValueError("rewritten lakefile.lean failed root validation")
     if rewritten != original:
         path.write_text(rewritten)
@@ -801,14 +886,28 @@ def synchronize_lake_roots(
     raise ValueError("project has no Lake manifest")
 
 
+def project_files(root: Path) -> list[Path]:
+    """Regular files under ``root`` outside ``.git``/``.lake``, sorted.
+
+    Symbolic links are never followed or listed: a vendored dependency linked
+    into a scratch copy belongs to the repository and must never be deleted.
+    """
+
+    found: list[Path] = []
+    for current, directories, files in os.walk(root):
+        if Path(current) == root:
+            directories[:] = [name for name in directories if name not in {".git", ".lake"}]
+        found.extend(
+            Path(current) / name for name in files
+            if not (Path(current) / name).is_symlink()
+        )
+    return sorted(found)
+
+
 def _tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(
-        candidate for candidate in root.rglob("*") if candidate.is_file()
-    ):
+    for path in project_files(root):
         relative = path.relative_to(root)
-        if relative.parts[0] in {".git", ".lake"}:
-            continue
         encoded = relative.as_posix().encode()
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -840,12 +939,7 @@ def normalize(
     closure = transitive_local_sources(resolved_entries, root)
     closure.difference_update(resolved_drops)
     assets = referenced_local_assets(closure, root)
-    before = [
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.relative_to(root).parts[0] not in {".git", ".lake"}
-    ]
+    before = project_files(root)
     removed: list[str] = []
     for path in before:
         if path in closure or path in assets or _keep_non_source(path, root):
@@ -873,12 +967,7 @@ def normalize(
             current.rmdir()
         except OSError:
             pass
-    after = [
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.relative_to(root).parts[0] not in {".git", ".lake"}
-    ]
+    after = project_files(root)
     retained_sources = sorted(
         path.relative_to(root).as_posix() for path in closure
     )
