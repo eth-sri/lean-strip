@@ -70,7 +70,7 @@ Everything the protected theorems depend on, by Lean's compiled terms, its `.ile
 - targets of `open … hiding` and `open … renaming`, and namespaces a surviving `open` needs;
 - the project's own copies of declarations that a dependency also declares.
 
-Files that declare the same full name as another file, and files whose `grind +suggestions` calls cannot be pinned to explicit lemmas, are kept whole. Path dependencies (vendored packages) are never changed.
+Files whose `grind +suggestions` or `grind +locals` calls cannot be pinned to explicit lemmas are kept whole. Path dependencies (vendored packages) are never changed.
 
 ### How files are edited
 

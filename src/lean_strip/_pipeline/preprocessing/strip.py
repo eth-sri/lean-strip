@@ -981,6 +981,21 @@ _OPEN_HIDING_RE = re.compile(
 )
 
 
+def _command_continuation(masked: str, end: int) -> str:
+    """The indented lines that continue a command whose first line ends at ``end``.
+
+    `open X hiding a b` and `open X renaming a → b` may list their names over
+    several lines; PALOMAR-2026-10-19-000009 hides 26 names over seven.
+    """
+
+    lines: list[str] = []
+    for line in masked[end:].split("\n")[1:]:
+        if not line.strip() or not line[:1].isspace():
+            break
+        lines.append(line)
+    return " ".join(lines)
+
+
 def detect_open_hiding_roots(
     decls: list[DeclRange], originals: dict[str, str]
 ) -> set[str]:
@@ -1002,9 +1017,10 @@ def detect_open_hiding_roots(
                 by_suffix.setdefault(name[index + 1 :], set()).add(name)
     roots: set[str] = set()
     for text in originals.values():
-        for namespaces, hidden in _OPEN_HIDING_RE.findall(
-            _mask_comments_preserve_layout(text)
-        ):
+        masked = _mask_comments_preserve_layout(text)
+        for match in _OPEN_HIDING_RE.finditer(masked):
+            namespaces = match.group(1)
+            hidden = match.group(2) + " " + _command_continuation(masked, match.end())
             opened = [n for n in namespaces.split() if _IDENT_RE.fullmatch(n)]
             for token in hidden.split():
                 if not _IDENT_RE.fullmatch(token):
@@ -1044,7 +1060,8 @@ def detect_open_renaming_roots(
         masked = _mask_comments_preserve_layout(text)
         namespace_by_line = _source_namespace_resolution_contexts(text)[0]
         for match in _OPEN_RENAMING_RE.finditer(masked):
-            namespace, pairs = match.group(1), match.group(2)
+            namespace = match.group(1)
+            pairs = match.group(2) + " " + _command_continuation(masked, match.end())
             line = masked.count("\n", 0, match.start()) + 1
             prefixes = _namespace_name_candidates(namespace, namespace_by_line.get(line, ""))
             for pair in _RENAMING_PAIR_RE.finditer(pairs):
@@ -1152,17 +1169,39 @@ _DECL_HEADER_RE = re.compile(
 
 
 def detect_duplicate_declaration_files(originals: dict[str, str]) -> set[str]:
-    """Return every file declaring a full name that another project file declares too.
+    """Return every file declaring a full name that another project file declares too."""
+
+    return {
+        path
+        for paths in duplicate_declaration_providers(originals).values()
+        for path in paths
+    }
+
+
+def duplicate_declaration_providers(originals: dict[str, str]) -> dict[str, set[str]]:
+    """Full names that more than one project file declares, with those files.
 
     Two modules that are never imported together may both declare
-    ``NumberField.foo`` (PALOMAR-2026-09-30-000031). The dependency graph loads
-    every project module into one environment, which holds only one of them,
-    so the other copy is invisible to it and must not be stripped blindly.
-    Full names follow the enclosing ``namespace``; ``private`` declarations are
+    ``NumberField.foo`` (PALOMAR-2026-09-30-000031). Lean merges two such
+    theorems at import when their statements agree, keeping one proof, so the
+    graph reads every copy from its own module's data (olean.py). Full names
+    follow the enclosing ``namespace``; ``private`` declarations are
     module-local in Lean and never collide.
     """
 
-    providers: dict[str, set[str]] = {}
+    return {
+        name: {path for path, _line, _written in copies}
+        for name, copies in duplicate_declaration_copies(originals).items()
+    }
+
+
+def duplicate_declaration_copies(
+    originals: dict[str, str],
+) -> dict[str, list[tuple[str, int, str]]]:
+    """Like ``duplicate_declaration_providers``, with each copy's header line
+    and the name as written there: ``(path, line, written name)``."""
+
+    copies: dict[str, list[tuple[str, int, str]]] = {}
     for path, text in originals.items():
         masked = _mask_comments_preserve_layout(text)
         namespaces, _opens = _source_namespace_resolution_contexts(text)
@@ -1174,12 +1213,29 @@ def detect_duplicate_declaration_files(originals: dict[str, str]) -> set[str]:
             namespace = namespaces.get(line_no, "")
             full = (name.removeprefix("_root_.") if name.startswith("_root_.") or not namespace
                     else f"{namespace}.{name}")
-            providers.setdefault(full, set()).add(path)
+            copies.setdefault(full, []).append((path, line_no, name))
     return {
-        path
-        for paths in providers.values() if len(paths) > 1
-        for path in paths
+        name: rows for name, rows in copies.items()
+        if len({path for path, _line, _written in rows}) > 1
     }
+
+
+def _graph_has_copy(
+    nodes: list[tuple[int, int, str]], line: int, written: str,
+) -> bool:
+    """Whether one of a module's graph ``nodes`` (start line, end line, source
+    name) is the declaration whose header, at ``line``, writes ``written``.
+
+    The graph's own range and name decide it, not the namespace the source
+    scan worked out: that scan can misread a file and invent a duplicate.
+    """
+
+    rooted = written.startswith("_root_.")
+    bare = written.removeprefix("_root_.")
+    return any(
+        start <= line <= end and (name == bare or (not rooted and name.endswith("." + bare)))
+        for start, end, name in nodes
+    )
 
 
 # Lean's source-range API occasionally attaches a surrounding scope command to
@@ -1278,9 +1334,36 @@ def plan_source_retention(
     structural_range_files = detect_structural_range_files(
         decls, originals, mod_path
     )
-    # The graph sees only one copy of a duplicated full name: keep every
-    # providing file verbatim and seed its declarations.
-    duplicate_provider_files = detect_duplicate_declaration_files(originals)
+    # The graph reads every copy of a duplicated full name from its own
+    # module. A copy it has no node for (a name the source scan reads
+    # differently from Lean) is invisible to it: keep that file verbatim and
+    # seed its declarations.
+    module_of_path = {path: module for module, path in mod_path.items()}
+    # A copy may be private: in a `module` file a declaration without `public`
+    # is, so Lean names it `_private.<Module>.0.<name>` and it collides with
+    # nothing (PALOMAR-2026-09-25-000001). Match it by its source name.
+    graph_copies = {
+        (_private_owner_and_display(str(decl["name"]))[1], str(decl["module"])) for decl in decls
+    }
+    # A copy also counts as seen when a node of its module spans its header
+    # and carries the name written there: the scan may have resolved the
+    # namespace wrongly (a `namespace Foo\r` it did not recognise read
+    # `Foo.minmax` as `minmax`, PALOMAR-2026-10-09-000003).
+    module_nodes: dict[str, list[tuple[int, int, str]]] = {}
+    for decl in decls:
+        if decl.get("start_line") is None or decl.get("end_line") is None:
+            continue
+        module_nodes.setdefault(str(decl["module"]), []).append((
+            int(decl["start_line"]), int(decl["end_line"]),
+            _private_owner_and_display(str(decl["name"]))[1],
+        ))
+    duplicate_provider_files = {
+        path
+        for name, copies in duplicate_declaration_copies(originals).items()
+        for path, line, written in copies
+        if (name, module_of_path.get(path)) not in graph_copies
+        and not _graph_has_copy(module_nodes.get(module_of_path.get(path, ""), []), line, written)
+    }
     mapped_files = set(mod_path.values())
     retain_exact_files |= duplicate_provider_files & mapped_files
     retained_modules |= {
@@ -3290,8 +3373,11 @@ def plan_protected_module_prune(
     if entry_module not in graph:
         raise ValueError(f"entry module {entry_module!r} absent from source graph")
 
-    owner_by_name = {decl["name"]: decl["module"] for decl in decls}
-    missing = sorted(protected_names - set(owner_by_name))
+    # A name two modules declare has a row per copy (olean.py); both stay live.
+    owners_by_name: dict[str, set[str]] = {}
+    for decl in decls:
+        owners_by_name.setdefault(decl["name"], set()).add(decl["module"])
+    missing = sorted(protected_names - set(owners_by_name))
     if missing:
         raise ValueError(f"protected declarations have no source owner: {missing}")
 
@@ -3300,8 +3386,8 @@ def plan_protected_module_prune(
         deps,
         protected_names,
     )
-    protected_modules = {owner_by_name[name] for name in protected_names}
-    live_modules = {owner_by_name[name] for name in live_declarations}
+    protected_modules = {module for name in protected_names for module in owners_by_name[name]}
+    live_modules = {module for name in live_declarations for module in owners_by_name.get(name, ())}
     explicit_keep_modules = set(extra_keep_modules or ())
     unknown_keep_modules = explicit_keep_modules - set(graph)
     if unknown_keep_modules:
@@ -3309,7 +3395,7 @@ def plan_protected_module_prune(
             "explicit keep modules absent from source graph: "
             f"{sorted(unknown_keep_modules)}"
         )
-    declaration_modules = set(owner_by_name.values())
+    declaration_modules = set().union(*owners_by_name.values()) if owners_by_name else set()
     elided_entry_import_hubs: set[str] = set()
     graph_for_keep = graph
     if collapse_entry_import_hubs and entry_module in live_modules:

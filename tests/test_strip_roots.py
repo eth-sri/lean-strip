@@ -121,6 +121,69 @@ def test_duplicate_full_names_across_files_are_detected_through_namespaces():
     assert strip.detect_duplicate_declaration_files(originals) == {"A.lean", "B.lean"}
 
 
+
+def test_duplicated_theorems_with_a_node_per_copy_are_stripped_normally():
+    # PALOMAR-2026-09-28-000003: Lean merges two theorems with one name and
+    # one statement at import; the graph reads each copy from its own module,
+    # so neither file has to be kept whole. A copy without a node still is.
+    originals = {
+        "A.lean": "namespace P\ntheorem dup : True := trivial\ntheorem a : True := trivial\nend P",
+        "B.lean": "namespace P\ntheorem dup : True := trivial\ntheorem b : True := trivial\nend P",
+        "C.lean": "namespace P\ntheorem dup : True := trivial\nend P",
+    }
+    mod_path = {"A": "A.lean", "B": "B.lean", "C": "C.lean"}
+    decls = [
+        {"name": "P.dup", "module": "A", "start_line": 2, "end_line": 2},
+        {"name": "P.a", "module": "A", "start_line": 3, "end_line": 3},
+        {"name": "P.dup", "module": "B", "start_line": 2, "end_line": 2},
+        {"name": "P.b", "module": "B", "start_line": 3, "end_line": 3},
+    ]
+    retention = strip.plan_source_retention(decls, originals, mod_path)
+    assert retention["retain_exact_files"] == {"C.lean"}
+
+
+
+def test_a_private_copy_in_a_module_file_is_not_an_unseen_duplicate():
+    # PALOMAR-2026-09-25-000001: in a `module` file, a `def` without `public`
+    # is private, so Lean names it `_private.B.0.P.f` and nothing collides;
+    # the source scan still pairs it with A's `P.f`. Neither file is kept whole.
+    originals = {
+        "A.lean": "namespace P\ndef f : Nat := 0\nend P",
+        "B.lean": "module\npublic import A\nnamespace P\ndef f : Nat := 1\nend P",
+    }
+    decls = [
+        {"name": "P.f", "module": "A", "start_line": 2, "end_line": 2},
+        {"name": "_private.B.0.P.f", "module": "B", "start_line": 4, "end_line": 4},
+    ]
+    retention = strip.plan_source_retention(decls, originals, {"A": "A.lean", "B": "B.lean"})
+    assert retention["retain_exact_files"] == set()
+
+
+def test_a_copy_the_graph_holds_under_its_true_name_is_not_an_unseen_duplicate():
+    # PALOMAR-2026-10-09-000003: the source scan did not recognise
+    # `namespace DirichletBridge\r` in a file with mixed line endings, so it
+    # read `DirichletBridge.minmax` as `minmax`, a duplicate of A's. The node
+    # spanning that header, named `….minmax`, shows Lean has the copy.
+    originals = {
+        "A.lean": "def minmax : Nat := 0\n",
+        "B.lean": "module\n\nnamespace DirichletBridge\r\n\r\ndef minmax : Nat := 1\r\nend DirichletBridge\n",
+    }
+    assert strip.duplicate_declaration_providers(originals) == {"minmax": {"A.lean", "B.lean"}}
+    decls = [
+        {"name": "minmax", "module": "A", "start_line": 1, "end_line": 1},
+        {"name": "DirichletBridge.minmax", "module": "B", "start_line": 5, "end_line": 5},
+    ]
+    mod_path = {"A": "A.lean", "B": "B.lean"}
+    assert strip.plan_source_retention(decls, originals, mod_path)["retain_exact_files"] == set()
+    # A node elsewhere in the file, or with another name, is not that copy:
+    # without one the file is still kept whole.
+    for other in ({"name": "DirichletBridge.minmax", "module": "B", "start_line": 3, "end_line": 3},
+                  {"name": "DirichletBridge.minmax2", "module": "B", "start_line": 5, "end_line": 5},
+                  {"name": "DirichletBridge.minmax", "module": "A", "start_line": 5, "end_line": 5}):
+        retention = strip.plan_source_retention([decls[0], other], originals, mod_path)
+        assert retention["retain_exact_files"] == {"B.lean"}
+
+
 def test_quoted_names_link_across_modules_without_imports():
     # PALOMAR-2026-09-27-000005: `#engine_certify` resolves
     # `FourColor.contractProg` by name in the module that uses the command.
@@ -534,6 +597,26 @@ def test_a_long_open_resolves_in_linear_time():
     text, stats = strip.remove_dead_commands(source, project, kept)
     assert time.perf_counter() - started < 5
     assert "open N7\ntheorem t" in text
+
+
+
+def test_names_hidden_or_renamed_on_continuation_lines_are_roots():
+    # PALOMAR-2026-10-19-000009: `open … hiding` listed 26 names over seven
+    # lines; only the first line's were rooted, and deleting
+    # `distinctMemoryExpression` from the third broke the whole `open`.
+    sources = {
+        "A.lean": "namespace G\ndef a : Nat := 0\ndef b : Nat := 0\ndef c : Nat := 0\ndef d : Nat := 0\nend G\n",
+        "B.lean": "\n".join([
+            "open G hiding a",
+            "  b c",
+            "open G renaming d → e,",
+            "  c → f",
+            "theorem t : True := trivial",
+        ]),
+    }
+    decls = [_decl(f"G.{n}", i, i) for i, n in enumerate("abcd", 2)]
+    assert strip.detect_open_hiding_roots(decls, sources) == {"G.a", "G.b", "G.c"}
+    assert strip.detect_open_renaming_roots(decls, sources) == {"G.d", "G.c"}
 
 
 def test_open_renaming_roots_the_renamed_declarations():

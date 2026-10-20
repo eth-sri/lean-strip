@@ -17,6 +17,7 @@ the comparator config, READMEs and every other file are left untouched, unless
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import posixpath
@@ -375,8 +376,14 @@ def _normalize_text(work: Path, skip: tuple[str, ...] = SKIP_DIRS) -> dict[str, 
     went unrecognised (PALOMAR-2026-10-13-000008). Normalizing once, here,
     removes that whole class of surprises. Returns, per changed file, whether it
     used CRLF and whether it had a BOM, so ``_apply_to_repository`` writes the
-    result back in the file's own style. A file with mixed line endings is left
-    alone: converting it back could not reproduce it.
+    result back in the file's own style.
+
+    A file with mixed line endings is normalized too. Leaving it alone hid its
+    ``namespace Foo\r`` lines from the source scans, which then read its
+    declarations as top-level names, took them for duplicates of other files'
+    declarations and kept the file whole (PALOMAR-2026-10-09-000003 and three
+    other results). ``_restore_line_endings`` gives every line the strip keeps
+    its own ending back.
     """
 
     styles: dict[str, tuple[bool, bool]] = {}
@@ -385,17 +392,51 @@ def _normalize_text(work: Path, skip: tuple[str, ...] = SKIP_DIRS) -> dict[str, 
         text = path.read_bytes().decode("utf-8")  # read_text would hide `\r\n`
         bom = text.startswith(_BOM)
         body = text.removeprefix(_BOM)
-        crlf = "\r\n" in body and body.count("\r\n") == body.count("\n")
+        crlf = "\r\n" in body
         if not (crlf or bom):
             continue
-        path.write_bytes((body.replace("\r\n", "\n") if crlf else body).encode("utf-8"))
+        path.write_bytes(body.replace("\r\n", "\n").encode("utf-8"))
         styles[relative] = (crlf, bom)
     return styles
 
 
-def _restore_text_style(content: str, style: tuple[bool, bool] | None) -> str:
+def _restore_line_endings(content: str, original: str | None) -> str:
+    """Put CRLF back where ``original`` had it.
+
+    A line the strip kept gets its own original ending, so a file with mixed
+    line endings that the strip leaves alone is reproduced byte for byte. A
+    line the strip wrote or edited gets the ending most of the file uses.
+    """
+
+    if original is None or "\r\n" not in original:
+        return content.replace("\n", "\r\n")
+    old = original.split("\n")
+    old_lines = [line.removesuffix("\r") for line in old]
+    if content == "\n".join(old_lines):
+        return original
+    old_crlf = [line.endswith("\r") for line in old[:-1]]
+    majority_crlf = 2 * sum(old_crlf) >= len(old_crlf)
+    new_lines = content.split("\n")
+    endings = [majority_crlf] * (len(new_lines) - 1)
+    matcher = difflib.SequenceMatcher(None, old_lines[:-1], new_lines[:-1])
+    for old_start, new_start, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            endings[new_start + offset] = old_crlf[old_start + offset]
+    return "".join(
+        line + ("\r\n" if crlf else "\n") for line, crlf in zip(new_lines, endings)
+    ) + new_lines[-1]
+
+
+def _restore_text_style(
+    content: str, style: tuple[bool, bool] | None, original: str | None = None,
+) -> str:
+    """Write ``content`` back in the style ``_normalize_text`` recorded;
+    ``original`` is the repository's file, for its per-line endings."""
+
     crlf, bom = style or (False, False)
-    return (_BOM if bom else "") + (content.replace("\n", "\r\n") if crlf else content)
+    if crlf:
+        content = _restore_line_endings(content, original and original.removeprefix(_BOM))
+    return (_BOM if bom else "") + content
 
 
 def _apply_to_repository(
@@ -419,7 +460,9 @@ def _apply_to_repository(
             (backup / relative).parent.mkdir(parents=True, exist_ok=True)
             (backup / relative).write_bytes(original)
         if relative in final:
-            content = _restore_text_style(final[relative], (styles or {}).get(relative)).encode("utf-8")
+            content = _restore_text_style(
+                final[relative], (styles or {}).get(relative), original.decode("utf-8", "replace"),
+            ).encode("utf-8")
             if content != original:
                 if backup is not None:
                     target.write_bytes(content)

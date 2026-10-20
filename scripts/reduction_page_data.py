@@ -77,7 +77,7 @@ def main() -> None:
     print(json.dumps({
         "registry": {"revision": table["registry_revision"], "release": table["registry_release"],
                      "snapshot": table["taken_at"]},
-        "tool": {"version": "1.1.0", "code": sorted(v for v in versions if v)},
+        "tool": {"version": "1.1.1", "code": sorted(v for v in versions if v)},
         "mode": "--retain-lean-only",
         "rows": rows,
     }, separators=(",", ":"), ensure_ascii=False))

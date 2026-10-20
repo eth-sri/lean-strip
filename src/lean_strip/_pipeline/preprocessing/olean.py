@@ -131,6 +131,26 @@ unsafe def main (args : List String) : IO Unit := do
     -- have no range. Filtering on `isInternal` instead (as before) silently
     -- dropped every private helper, severing dependency paths and making the
     -- closure badly incomplete.
+    -- Names more than one project module declares (see below).
+    let mut declaredOnce : NameHashSet := {}
+    let mut dupNames : NameHashSet := {}
+    for i in [0:env.header.moduleNames.size] do
+      if projModNames.contains env.header.moduleNames[i]! then
+        if let some data := env.header.moduleData[i]? then
+          for cname in data.constNames do
+            if declaredOnce.contains cname then
+              dupNames := dupNames.insert cname
+            else
+              declaredOnce := declaredOnce.insert cname
+    let mut dupModules : NameHashSet := {}
+    if !dupNames.isEmpty then
+      for i in [0:env.header.moduleNames.size] do
+        let modName := env.header.moduleNames[i]!
+        if projModNames.contains modName then
+          if let some data := env.header.moduleData[i]? then
+            if data.constNames.any dupNames.contains then
+              dupModules := dupModules.insert modName
+
     let mut nodes : Array (Name × Name × ConstantInfo × String) := #[]
     let mut projNameSet : NameHashSet := {}
     for (name, cinfo) in env.constants.toList do
@@ -138,7 +158,7 @@ unsafe def main (args : List String) : IO Unit := do
       | none => pure ()
       | some modIdx =>
         let modName := env.header.moduleNames[modIdx]!
-        if projModNames.contains modName then
+        if projModNames.contains modName && !dupNames.contains name then
           match ← findDeclarationRanges? name with
           | some dr =>
             let r := dr.range
@@ -146,6 +166,27 @@ unsafe def main (args : List String) : IO Unit := do
             nodes := nodes.push (name, modName, cinfo, rangeStr)
             projNameSet := projNameSet.insert name
           | none => pure ()
+
+    -- A theorem two modules both declare is merged at import when the two
+    -- statements agree (Lean compares types, not proofs): `env` credits the
+    -- first module but may hold another module's proof. Every copy is still in
+    -- its own module's data, with its own proof and range, so each becomes a
+    -- node of its own module and the strip sees what each proof uses
+    -- (PALOMAR-2026-09-28-000003).
+    for i in [0:env.header.moduleNames.size] do
+      let modName := env.header.moduleNames[i]!
+      if !projModNames.contains modName || !dupModules.contains modName then continue
+      let some modIdx := env.getModuleIdx? modName | continue
+      let some data := env.header.moduleData[i]? | continue
+      let ranges : NameMap DeclarationRanges := (declRangeExt.getModuleEntries env modIdx).foldl
+        (fun acc (n, r) => acc.insert n r) {}
+      for cname in data.constNames, cinfo in data.constants do
+        if !dupNames.contains cname then continue
+        if let some dr := ranges.find? cname then
+          let r := dr.range
+          let rangeStr := s!"{r.pos.line}\t{r.pos.column}\t{r.endPos.line}\t{r.endPos.column}"
+          nodes := nodes.push (cname, modName, cinfo, rangeStr)
+          projNameSet := projNameSet.insert cname
 
     return (nodes, projNameSet, importedNamespaces)
   let ((nodes, projNameSet, importedNamespaces), _) ← action.toIO coreCtx coreState
