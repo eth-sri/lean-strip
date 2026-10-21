@@ -6,19 +6,15 @@ It works on a Palomar-registry style repository: a Lake project with a comparato
 
 ## Install
 
-```sh
-curl -LsSf https://raw.githubusercontent.com/eth-sri/lean-strip/main/install.sh | sh
-```
-
-The installer installs [uv](https://docs.astral.sh/uv/) if needed, then installs `lean-strip` as an isolated uv tool with its own Python. You also need Lean (`elan`/`lake`) on your `PATH`. It runs on Linux and macOS.
-
-With uv already installed, either of these works:
+lean-strip is installed with [uv](https://docs.astral.sh/uv/). If you don't have uv yet, install it first ([installation guide](https://docs.astral.sh/uv/getting-started/installation/)), then:
 
 ```sh
 uv tool install git+https://github.com/eth-sri/lean-strip           # permanent `lean-strip` command
-uvx --from git+https://github.com/eth-sri/lean-strip lean-strip     # one-off run
+uvx --from git+https://github.com/eth-sri/lean-strip lean-strip     # or a one-off run, without installing
 uv tool upgrade lean-strip                                          # update
 ```
+
+You also need Lean (`elan`/`lake`) on your `PATH`. It runs on Linux and macOS.
 
 ## Use
 
