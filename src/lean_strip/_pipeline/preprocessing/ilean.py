@@ -10,6 +10,7 @@ graph; it never removes or replaces another evidence source.
 
 from __future__ import annotations
 
+import bisect
 from collections import Counter, defaultdict
 import json
 from typing import Any, Iterable, Mapping
@@ -56,34 +57,73 @@ def _resolve_in_module(
     raw_name: str,
     module: str,
     names: set[str],
-    names_by_module: Mapping[str, set[str]],
+    names_by_last: Mapping[str, Mapping[str, set[str]]],
 ) -> set[str]:
+    """``raw_name`` as a project name, else the names of ``module`` that are
+    ``raw_name``, end in ``.raw_name`` or share its last component; the first
+    two imply the third, so ``names_by_last`` (module -> last component ->
+    names) answers it without scanning the module."""
+
     if raw_name in names:
         return {raw_name}
     qualified = f"{module}.{raw_name}" if module else raw_name
     if qualified in names:
         return {qualified}
-    last = raw_name.rsplit(".", 1)[-1]
-    candidates = {
-        name
-        for name in names_by_module.get(module, set())
-        if name == raw_name
-        or name.endswith("." + raw_name)
-        or name.rsplit(".", 1)[-1] == last
-    }
-    return candidates
+    return set(names_by_last.get(module, {}).get(raw_name.rsplit(".", 1)[-1], ()))
+
+
+class _ModuleRanges:
+    """One module's declaration ranges, for finding the ones around a usage.
+
+    A usage can lie in thousands of declarations' module (generated
+    certificate files); scanning every range per usage is quadratic. Sorted by
+    start with a running maximum of the ends, the ranges that can contain a
+    usage are the ones before it whose prefix still reaches past it.
+    """
+
+    def __init__(self, decls: list[DeclRange]) -> None:
+        rows = []
+        for decl in decls:
+            values = (decl.get("start_line"), decl.get("start_col"),
+                      decl.get("end_line"), decl.get("end_col"))
+            if any(value is None for value in values):
+                continue  # `_contains` never holds for it
+            start = _pos(int(values[0]), int(values[1]))
+            end = _pos(int(values[2]), int(values[3]))
+            rows.append((start, end, decl))
+        rows.sort(key=lambda row: row[0])
+        self._starts = [row[0] for row in rows]
+        self._rows = rows
+        self._reach: list[tuple[int, int]] = []
+        reach: tuple[int, int] | None = None
+        for _start, end, _decl in rows:
+            reach = end if reach is None or end > reach else reach
+            self._reach.append(reach)
+
+    def containing(self, usage: list[Any]) -> list[DeclRange]:
+        """The declarations ``_contains(decl, usage)`` holds for."""
+
+        if len(usage) < 4 or any(not isinstance(value, int) for value in usage[:4]):
+            return []
+        usage_start = _pos(usage[0], usage[1])
+        usage_end = _pos(usage[2], usage[3])
+        found = []
+        index = bisect.bisect_right(self._starts, usage_start) - 1
+        while index >= 0 and self._reach[index] >= usage_end:
+            _start, end, decl = self._rows[index]
+            if usage_end <= end:
+                found.append(decl)
+            index -= 1
+        return found
 
 
 def _positional_owners(
     source_module: str,
     usage: list[Any],
-    decls_by_module: Mapping[str, list[DeclRange]],
+    ranges_by_module: Mapping[str, _ModuleRanges],
 ) -> set[str]:
-    candidates = [
-        decl
-        for decl in decls_by_module.get(source_module, [])
-        if _contains(decl, usage)
-    ]
+    ranges = ranges_by_module.get(source_module)
+    candidates = ranges.containing(usage) if ranges is not None else []
     if not candidates:
         return set()
     narrowest = min(_span_key(decl) for decl in candidates)
@@ -111,13 +151,19 @@ def union_ilean_documents(
 
     names = {str(decl["name"]) for decl in decls}
     requested_modules = set(modules or (str(decl["module"]) for decl in decls))
-    names_by_module: dict[str, set[str]] = defaultdict(set)
+    names_by_last: dict[str, dict[str, set[str]]] = defaultdict(dict)
     decls_by_module: dict[str, list[DeclRange]] = defaultdict(list)
     for decl in decls:
         module = str(decl["module"])
-        names_by_module[module].add(str(decl["name"]))
+        name = str(decl["name"])
+        names_by_last[module].setdefault(name.rsplit(".", 1)[-1], set()).add(name)
         if decl.get("start_line") is not None:
             decls_by_module[module].append(decl)
+    ranges_by_module = {
+        module: _ModuleRanges(module_decls)
+        for module, module_decls in decls_by_module.items()
+    }
+    del decls_by_module
 
     out = {name: set(targets) for name, targets in deps.items()}
     original_edges = {
@@ -190,7 +236,7 @@ def union_ilean_documents(
                 continue
             constant_references += 1
             targets = _resolve_in_module(
-                target_name, target_module, names, names_by_module
+                target_name, target_module, names, names_by_last
             )
             target_is_project_local = target_module in requested_modules
             if not targets:
@@ -212,12 +258,12 @@ def union_ilean_documents(
                 if len(usage) >= 5 and isinstance(usage[4], str):
                     raw_named_owner = usage[4]
                     named_owners = _resolve_in_module(
-                        raw_named_owner, module, names, names_by_module
+                        raw_named_owner, module, names, names_by_last
                     )
                     if named_owners:
                         named_owner_usages += 1
                 positional_owners = _positional_owners(
-                    module, usage, decls_by_module
+                    module, usage, ranges_by_module
                 )
                 if named_owners and positional_owners and (
                     named_owners != positional_owners

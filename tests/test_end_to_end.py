@@ -134,3 +134,70 @@ def test_edits_come_from_lean_and_build_without_repairs(tmp_path, monkeypatch):
     report = json.loads((root / ".lean-strip/report.json").read_text())["engine_report"]
     assert report["lean_syntax"]["files_analyzed"] >= 1 and not report["lean_syntax"]["failures"]
     assert "Lib/A.lean" in report["strip"]["lean_edited_files"]
+
+
+# `site` and `site2` realize `f.eq_1` and `g.eq_2` in Lib.B. The comparator
+# compares `t` exactly (its value included: `main_thm` states something about
+# `h`, whose body uses `t`); had the strip dropped the sites, `t` would realize
+# the lemmas itself and its `_proof_N` would shift (PALOMAR-2026-10-20-000013).
+_REALIZATION_FILES = {
+    "Lib/A.lean": "module\n\n@[expose] public section\n\n"
+                  "def f (n : Nat) : Nat :=\n  if h : n = 0 then 1 else f (n - 1) + 2\n"
+                  "termination_by n\ndecreasing_by omega\n\n"
+                  "def g : Nat → Nat\n  | 0 => 1\n  | n + 1 => g n + 2\n",
+    "Lib/B.lean": "module\n\npublic import Lib.A\n\n@[expose] public section\n\n"
+                  "theorem site (n : Nat) : f (n + 1) = f n + 2 := by rw [f]; simp\n\n"
+                  "theorem site2 (n : Nat) : g (n + 1) = g n + 2 := by rw [g]\n\n"
+                  "theorem unused_here : g 0 = 1 := rfl\n",
+    "Lib/C.lean": "module\n\npublic import Lib.B\n\n@[expose] public section\n\n"
+                  "theorem t (n : Nat) (h : n > 2) : f n ≥ 2 ∧ g (n + 1) ≥ 2 ∧ n > 1 := by\n"
+                  "  rw [f, g]\n  exact ⟨by split <;> omega, by omega, by omega⟩\n\n"
+                  "def h (n : Nat) (hn : n > 2) : Fin (n + 1) := ⟨0, by have := (t n hn).2.2; omega⟩\n",
+    "Solution.lean": "module\n\npublic import Lib.C\n\n@[expose] public section\n\n"
+                     "theorem main_thm (n : Nat) (hn : n > 2) : (h n hn).val = 0 := rfl\n",
+    "Challenge.lean": "module\n\npublic import Lib.C\n\n@[expose] public section\n\n"
+                      "theorem main_thm (n : Nat) (hn : n > 2) : (h n hn).val = 0 := sorry\n",
+    "lakefile.toml": 'name = "real"\n[[lean_lib]]\nname = "Lib"\n[[lean_lib]]\nname = "Solution"\n'
+                     '[[lean_lib]]\nname = "Challenge"\n',
+}
+
+
+def test_closure_query_finds_realization_sites(tmp_path):
+    from lean_strip._pipeline.preprocessing import comparator_closure as cc
+
+    root = tmp_path
+    for relative, text in {"lean-toolchain": TOOLCHAIN, **_REALIZATION_FILES}.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(text)
+    subprocess.run(["lake", "build", "Solution"], cwd=root, check=True, capture_output=True)
+    (root / "closure.lean").write_text(cc._COMPARATOR_CLOSURE_LEAN)
+    (root / "input.txt").write_text(cc.closure_input(
+        "Solution", ["Lib.A", "Lib.B", "Lib.C", "Solution"], ["main_thm"], ["g"], ["propext"]))
+    out = subprocess.run(["lake", "env", "lean", "--run", "closure.lean", "input.txt"],
+                         cwd=root, check=True, capture_output=True, text=True).stdout
+    compared, reach = cc.parse_closure_output(out)
+    # `h` is compared with its body, so `t` is compared with its proof; `g`
+    # is a definition target, so only its type is walked.
+    assert compared["t"] == ("Lib.C", True) and compared["h"] == ("Lib.C", True)
+    assert "unused_here" not in compared
+    sites = cc.realization_sites(reach)
+    assert sites["f.eq_1"] == {"Lib.B": "site"}
+    assert sites["g.eq_2"] == {"Lib.B": "site2"}
+
+
+@pytest.mark.parametrize("definitions", [["g"], []])
+def test_definition_configs_keep_realization_sites(tmp_path, definitions):
+    comparator = {**COMPARATOR, "definition_names": definitions, "permitted_axioms": ["propext"]}
+    root = _project(tmp_path, _REALIZATION_FILES, comparator=comparator)
+
+    assert cli.main([str(root), "--jobs", "2", "--quiet", "--skip-comparator"]) == 0
+
+    text = (root / "Lib/B.lean").read_text()
+    report = json.loads((root / ".lean-strip/report.json").read_text())["engine_report"]
+    assert "unused_here" not in text
+    if definitions:
+        assert "theorem site " in text and "theorem site2 " in text
+        assert {"site", "site2"} <= set(report["comparator_closure"]["site_roots"])
+    else:
+        # A theorem-only config keeps the strip it had.
+        assert "theorem site " not in text and "comparator_closure" not in report

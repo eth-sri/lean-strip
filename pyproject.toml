@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lean-strip"
-version = "1.1.1"
+version = "1.1.2"
 description = "Strip a Lean repository down to what its protected results need."
 readme = "README.md"
 license = "MIT"

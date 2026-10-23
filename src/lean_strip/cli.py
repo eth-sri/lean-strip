@@ -597,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=21600, help="per-command timeout in seconds (default: 21600)")
     parser.add_argument("--quiet", action="store_true", help="only print the final summary")
     parser.add_argument("--clean-certify", action="store_true", help="also rebuild the stripped project from a clean .lake/build before accepting it")
+    parser.add_argument("--graph-only", action="store_true", help="build the solution/challenge closure and write lean-strip's declaration dependency graph to .lean-strip/dependency-graph.json; strip nothing and leave the repository unchanged")
     parser.add_argument("--skip-comparator", action="store_true", help="do not run comparator (Palomar's judge) on the stripped tree at the end")
     parser.add_argument("--retain-lean-only", action="store_true", help="also delete every file the Lean build does not need (READMEs, docs, scripts, CI, ...); the challenge, comparator config, Lake files and files the Lean code reads stay; git-ignored files stay")
     container.add_arguments(parser)
@@ -626,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # The default mode writes .lean files and, when it must, the lakefile.
     dirty = _dirty_files(repo, *(() if strict else ("*.lean", "lakefile.toml", "lakefile.lean")))
-    if dirty and not args.force and not args.dry_run:
+    if dirty and not args.force and not args.dry_run and not args.graph_only:
         parser.error(
             f"uncommitted {'' if strict else '.lean or lakefile '}changes "
             "(commit them or pass --force): " + ", ".join(dirty[:10])
@@ -669,7 +670,9 @@ def main(argv: list[str] | None = None) -> int:
         console.say(f"  requires   {', '.join(requires)}")
     if dependencies:
         console.say(f"  vendored   {', '.join(dependencies)} (dependencies, left untouched)")
-    console.say(f"  jobs       {args.jobs}" + ("   (dry run: the repository stays unchanged)"
+    console.say(f"  jobs       {args.jobs}" + ("   (graph only: the repository stays unchanged)"
+                                                if args.graph_only else
+                                                "   (dry run: the repository stays unchanged)"
                                                 if args.dry_run else ""))
     console.say("")
     before = measure_tree(repo, skip=skip, exclude={challenge_rel})
@@ -755,12 +758,35 @@ def main(argv: list[str] | None = None) -> int:
             entry_module=solution_module,
             build_target=build_target,
             protected=set(comparator["protected"]),
+            theorem_names=tuple(comparator.get("theorem_names", [])),
+            definition_names=tuple(comparator.get("definition_names", [])),
+            permitted_axioms=tuple(comparator.get("permitted_axioms", [])),
             diagnostics_dir=diagnostics,
             query_timeout=args.timeout,
             file_workers=args.jobs,
             clean_certify=args.clean_certify,
+            graph_only=args.graph_only,
         )
         result = run_strip(ws, settings, console.stage)
+
+        if result.graph_only:
+            graph_file = state / "dependency-graph.json"
+            shutil.copyfile(diagnostics / "dependency-graph.json", graph_file)
+            evidence = result.report.get("dependency_evidence") or {}
+            outcome = {
+                "status": "graph",
+                "graph": str(graph_file),
+                "declarations": len(result.decls),
+                "edges": evidence.get("total_edges"),
+                "modules": len(result.module_paths),
+            }
+            if not args.keep_work:
+                shutil.rmtree(work, ignore_errors=True)
+            console.say("", always=True)
+            console.say(f"dependency graph: {len(result.decls)} declarations, "
+                        f"{outcome['edges']} edges, {outcome['modules']} modules", always=True)
+            console.say(f"written to {graph_file}", always=True)
+            return 0
 
         if not result.discarded:
             with console.stage("Challenge check") as stage:

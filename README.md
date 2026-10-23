@@ -45,6 +45,7 @@ The comparator config is found automatically when the repository has exactly one
 - `--force`: run over uncommitted `.lean` or lakefile changes (any changes with `--retain-lean-only`).
 - `--skip-comparator`: do not run comparator.
 - `--clean-certify`: also rebuild the stripped tree from an empty `.lake/build`.
+- `--graph-only`: build the solution/challenge closure and write the declaration dependency graph to `.lean-strip/dependency-graph.json`, leaving the project's sources unchanged.
 - `--container [podman|docker]`: run inside a container; the repository is mounted, not copied.
 - `--memory SIZE`, `--cpus N`: with `--container`, limit memory (no swap) and CPUs.
 - `--image IMAGE`: with `--container`, the image to run in (default: built on first use).
@@ -62,11 +63,14 @@ Everything the protected theorems depend on, by Lean's compiled terms, its `.ile
 - every declaration with an attribute, and every target of an `attribute` command;
 - declarations an `attribute` command generates, such as the `_assoc` lemma of `attribute [reassoc] foo`;
 - instances, macros, syntax, notation, elaborators, simprocs, unification hints and other `meta` declarations;
+- names used in a kept notation or macro body, including fields on section variables;
 - names used in `run_cmd`, `run_elab` and `run_meta`;
 - targets of `open … hiding` and `open … renaming`, and namespaces a surviving `open` needs;
 - the project's own copies of declarations that a dependency also declares.
 
 Files whose `grind +suggestions` or `grind +locals` calls cannot be pinned to explicit lemmas are kept whole. Path dependencies (vendored packages) are never changed.
+
+Protected generated helpers, such as `foo._proof_1`, keep their source declaration. When the comparator config lists `definition_names`, lean-strip also keeps declarations that create auxiliary constants the comparator compares exactly, preserving their names through the rebuild.
 
 ### How files are edited
 
@@ -75,6 +79,12 @@ Lean re-elaborates every file the strip changes and reports each command's exten
 ### When the stripped tree does not build
 
 `lean-strip` raises the heartbeat limit of a declaration that times out, silences the `privateModule` linter, or restores a file where `grind` fails; any other error fails the run, with the errors in `.lean-strip/diagnostics/`. A run that needed a repair reports `repaired`.
+
+## Registry validation
+
+The 1.1.2 validation snapshot covers all **739 results** at Palomar registry revision 494 (2026-10-22): **735 stripped and accepted by Comparator**, and 4 with nothing to strip because their proofs live in dependencies. Two accepted runs needed a raised heartbeat limit on one declaration.
+
+The runs removed **36.0% of Lean tokens overall**, with 29.5% removed per result on average and a median of 19.4%. The graph optimizations passed 35 differential regression runs with matching graphs and artifacts. See [the per-result counts, verdicts and runtimes](RESULTS.md).
 
 ## License
 

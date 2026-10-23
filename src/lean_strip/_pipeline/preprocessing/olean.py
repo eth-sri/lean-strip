@@ -64,14 +64,27 @@ partial def auxOwners (env : Environment) (isProject : Name → Bool)
     | info            => #[info.type]
   let consts := exprs.foldl
     (fun acc e => e.foldConsts acc fun c acc => if isProject c && c != n then acc.push c else acc) #[]
+  -- Each owner once, in order of first occurrence. Concatenating the
+  -- auxiliaries' lists as they are repeats an owner once per path to it, and
+  -- the paths through auxiliaries that share auxiliaries are exponentially
+  -- many: the range-less LRAT step lemmas behind PALOMAR-2026-10-22-000009's
+  -- `pairing8Refutation` would have given it a list of about 10^104 names.
   let mut out : Array Name := #[]
+  let mut seen : NameHashSet := {}
   for c in consts do
     if ranged.contains c then
-      out := out.push c
+      if !seen.contains c then
+        seen := seen.insert c
+        out := out.push c
     else
       if let some owner := owner? c then
-        out := out.push owner
-      out := out ++ (← auxOwners env isProject ranged owner? memo c)
+        if !seen.contains owner then
+          seen := seen.insert owner
+          out := out.push owner
+      for owner in (← auxOwners env isProject ranged owner? memo c) do
+        if !seen.contains owner then
+          seen := seen.insert owner
+          out := out.push owner
   memo.modify (·.insert n out)
   return out
 

@@ -124,6 +124,135 @@ def _binder_head_types(span: str) -> dict[str, str]:
     return out
 
 
+class _VisibleNames:
+    """The project declarations visible from one module, by index key.
+
+    ``by_display``, ``by_last`` and ``by_suffix`` answer ``.get`` like a dict
+    from key to the set of visible names, and ``name in view`` tests one name.
+    """
+
+    def __init__(self, names: "_ProjectNames", module: str, closure: set[str]) -> None:
+        self.module = module
+        self._names = names
+        self._closure = closure
+        self._visible: dict[str, bool] = {}
+        self.by_display = _VisibleIndex(names.by_display, self)
+        self.by_last = _VisibleIndex(names.by_last, self)
+        self.by_suffix = _VisibleIndex(names.by_suffix, self)
+
+    def __contains__(self, name: object) -> bool:
+        if not isinstance(name, str):
+            return False
+        known = self._visible.get(name)
+        if known is None:
+            modules = self._names.modules_of.get(name, ())
+            owner = self._names.private_owner.get(name)
+            # An unreachable private homonym would make a real same-module
+            # reference look ambiguous.
+            known = (owner is None or owner == self.module) and any(
+                module in self._closure for module in modules
+            )
+            self._visible[name] = known
+        return known
+
+
+class _VisibleIndex:
+    """One project-wide name index, filtered to one module's visible names."""
+
+    def __init__(self, index: dict[str, list[str]], visible: _VisibleNames) -> None:
+        self._index = index
+        self._visible = visible
+        self._cache: dict[str, frozenset[str]] = {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        hits = self._cache.get(key)
+        if hits is None:
+            hits = frozenset(name for name in self._index.get(key, ()) if name in self._visible)
+            self._cache[key] = hits
+        return hits if hits else default
+
+
+class _ProjectNames:
+    """Every project declaration indexed once by its display name, its last
+    component and every dotted suffix of the display name.
+
+    A module sees the names of its transitive project-import closure. Indexing
+    that set separately for every module costs memory proportional to the sum
+    of all closures, which a project of ten thousand modules does not have
+    (PALOMAR-2026-10-21-000025); the shared index is filtered per lookup.
+    """
+
+    def __init__(self, names_by_module: dict[str, set[str]]) -> None:
+        self.modules_of: dict[str, list[str]] = {}
+        for module, module_names in names_by_module.items():
+            for name in module_names:
+                self.modules_of.setdefault(name, []).append(module)
+        self.private_owner: dict[str, str] = {}
+        self.by_display: dict[str, list[str]] = {}
+        self.by_last: dict[str, list[str]] = {}
+        self.by_suffix: dict[str, list[str]] = {}
+        for name in self.modules_of:
+            owner, display = _private_owner_and_display(name)
+            if owner is not None:
+                self.private_owner[name] = owner
+            self.by_display.setdefault(display, []).append(name)
+            self.by_last.setdefault(display.rsplit(".", 1)[-1], []).append(name)
+            for index, char in enumerate(display):
+                if char == "." and index + 1 < len(display):
+                    self.by_suffix.setdefault(display[index + 1 :], []).append(name)
+
+    def visible_from(self, module: str, closure: set[str]) -> _VisibleNames:
+        return _VisibleNames(self, module, closure)
+
+
+def _enclosing_declarations(file_decls: list[DeclRange]) -> list[list[str]]:
+    """For each declaration of one file, the other names whose source range
+    strictly contains its range (an identical range does not count)."""
+
+    spans = [
+        (
+            (int(decl["start_line"]), int(decl.get("start_col") or 0)),
+            (int(decl["end_line"]), int(decl.get("end_col") or 0)),
+        )
+        for decl in file_decls
+    ]
+    if any(end < start for start, end in spans):
+        # The sweep below assumes well-formed ranges; compare every pair.
+        return [
+            [
+                outer["name"]
+                for outer, (outer_start, outer_end) in zip(file_decls, spans)
+                if outer["name"] != child["name"]
+                and outer_start <= child_start
+                and child_end <= outer_end
+                and (outer_start, outer_end) != (child_start, child_end)
+            ]
+            for child, (child_start, child_end) in zip(file_decls, spans)
+        ]
+    members: dict[tuple[tuple[int, int], tuple[int, int]], list[int]] = {}
+    for index, span in enumerate(spans):
+        members.setdefault(span, []).append(index)
+    # By start, widest first: every range that contains a span comes before
+    # it, and a range that ends before a span starts contains nothing later.
+    ordered = sorted(members, key=lambda span: (span[0], -span[1][0], -span[1][1]))
+    containers: dict[tuple[tuple[int, int], tuple[int, int]], list[tuple[tuple[int, int], tuple[int, int]]]] = {}
+    open_spans: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for span in ordered:
+        start, end = span
+        open_spans = [other for other in open_spans if other[1] >= start]
+        containers[span] = [other for other in open_spans if other[1] >= end]
+        open_spans.append(span)
+    return [
+        [
+            file_decls[outer]["name"]
+            for container in containers[span]
+            for outer in members[container]
+            if file_decls[outer]["name"] != child["name"]
+        ]
+        for child, span in zip(file_decls, spans)
+    ]
+
+
 def augment_deps_with_source(
     decls: list[DeclRange],
     deps: dict[str, set[str]],
@@ -164,7 +293,7 @@ def augment_deps_with_source(
         if source_root is not None
         else {}
     )
-    visible_names_by_module: dict[str, set[str]] = {}
+    names = _ProjectNames(names_by_module)
     source_lines_by_path: dict[
         str,
         tuple[
@@ -174,58 +303,23 @@ def augment_deps_with_source(
             dict[int, tuple[str, ...]],
         ],
     ] = {}
-    lookup_indexes_by_module: dict[
-        str,
-        tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]],
-    ] = {}
 
-    def visible_names(module: str) -> set[str]:
-        cached = visible_names_by_module.get(module)
-        if cached is not None:
-            return cached
-        # `_closure` always contains `module` itself, even without a graph.
-        names: set[str] = set()
-        for visible_module in _closure(import_graph, {module}):
-            for name in names_by_module.get(visible_module, ()):
-                owner, _display = _private_owner_and_display(name)
-                if owner is not None and owner != module:
-                    # Unreachable private homonym: including it would make a
-                    # real same-module reference look ambiguous.
-                    continue
-                names.add(name)
-        visible_names_by_module[module] = names
-        return names
-
-    def lookup_indexes(
-        module: str,
-    ) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
-        """Index last components and every dotted suffix once per module.
-
-        Large generated declarations can contain hundreds of thousands of
-        identifier tokens. Scanning the full visible-name set for each token
-        is quadratic in practice; these indexes preserve the exact string
-        matching policy while making each lookup constant-time.
-        """
-
-        cached = lookup_indexes_by_module.get(module)
-        if cached is not None:
-            return cached
-        by_last: dict[str, set[str]] = {}
-        by_suffix: dict[str, set[str]] = {}
-        by_display: dict[str, set[str]] = {}
-        for name in visible_names(module):
-            _owner, display = _private_owner_and_display(name)
-            by_display.setdefault(display, set()).add(name)
-            by_last.setdefault(display.rsplit(".", 1)[-1], set()).add(name)
-            for index, char in enumerate(display):
-                if char == "." and index + 1 < len(display):
-                    by_suffix.setdefault(display[index + 1 :], set()).add(name)
-        cached = by_last, by_suffix, by_display
-        lookup_indexes_by_module[module] = cached
-        return cached
-
-    out = {k: set(v) for k, v in deps.items()}
-    for d in decls:
+    # One module at a time, so that only one module's view of the visible
+    # names and one module's source lines are alive at once. The edges found
+    # are applied in declaration order afterwards.
+    indexes_by_module: dict[str, list[int]] = {}
+    for index, decl in enumerate(decls):
+        indexes_by_module.setdefault(decl["module"], []).append(index)
+    token_edges: dict[int, set[str]] = {}
+    quoted_edges: dict[int, list[str]] = {}
+    # A quoted name is matched against every project declaration (see below).
+    all_names = {str(decl["name"]) for decl in decls}
+    view: _VisibleNames | None = None
+    for index in [index for indexes in indexes_by_module.values() for index in indexes]:
+        d = decls[index]
+        if view is not None and view.module != d["module"]:
+            view = None
+            source_lines_by_path.clear()
         if d["start_line"] is None:
             continue
         path = mod_path.get(d["module"])
@@ -254,9 +348,11 @@ def augment_deps_with_source(
         )
         span = "\n".join(lines[start - 1: d["end_line"]])
         span = _mask_comments_preserve_layout(span)
-        edges = out.setdefault(d["name"], set())
-        visible = visible_names(d["module"])
-        by_last, by_suffix, by_display = lookup_indexes(d["module"])
+        edges = token_edges[index] = set()
+        if view is None:
+            # `_closure` always contains `module` itself, even without a graph.
+            view = names.visible_from(d["module"], _closure(import_graph, {d["module"]}))
+        visible, by_last, by_suffix, by_display = view, view.by_last, view.by_suffix, view.by_display
         declaration_line = min(
             len(code_lines), max(1, int(d["start_line"]))
         )
@@ -382,6 +478,29 @@ def augment_deps_with_source(
                 if c != d["name"]:
                     edges.add(c)
 
+        # A quoted name (`` `Foo.bar `` or ``` ``Foo.bar ```) is looked up when
+        # the code runs, in the environment of whichever module uses it, not of
+        # the module that wrote it: `resolveConst? `FourColor.contractProg`
+        # inside a command elaborator (PALOMAR-2026-09-27-000005). Exact full
+        # names are matched against every project declaration, without the
+        # visibility filter.
+        start_line = int(d["start_line"])
+        code_span = "\n".join(code_lines[start_line - 1 : int(d["end_line"])])
+        for match in _QUOTED_NAME_RE.finditer(code_span):
+            quoted = match.group(1).removeprefix("_root_.")
+            # ``Foo resolves through the enclosing namespaces when it is written.
+            line = start_line + code_span.count("\n", 0, match.start())
+            candidates = (_namespace_name_candidates(quoted, namespace_contexts.get(line, ""))
+                          if match.group(0).startswith("``") else [quoted])
+            hit = next((candidate for candidate in candidates if candidate in all_names), None)
+            if hit is not None and hit != d["name"]:
+                quoted_edges.setdefault(index, []).append(hit)
+
+    out = {k: set(v) for k, v in deps.items()}
+    for index, d in enumerate(decls):
+        if index in token_edges:
+            out.setdefault(d["name"], set()).update(token_edges[index])
+
     # Lean exposes source-backed local declarations such as a `let rec`
     # helper as separate constants whose ranges are strictly nested inside the
     # enclosing command. The local constant can occur in the dependency graph
@@ -396,51 +515,13 @@ def augment_deps_with_source(
         if path and path in originals:
             ranged_by_path.setdefault(path, []).append(decl)
 
-    def source_interval(
-        decl: DeclRange,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        return (
-            (int(decl["start_line"]), int(decl.get("start_col") or 0)),
-            (int(decl["end_line"]), int(decl.get("end_col") or 0)),
-        )
-
     for file_decls in ranged_by_path.values():
-        intervals = [(decl, *source_interval(decl)) for decl in file_decls]
-        for child, child_start, child_end in intervals:
-            edges = out.setdefault(child["name"], set())
-            for outer, outer_start, outer_end in intervals:
-                if outer["name"] == child["name"]:
-                    continue
-                if (
-                    outer_start <= child_start
-                    and child_end <= outer_end
-                    and (outer_start, outer_end) != (child_start, child_end)
-                ):
-                    edges.add(outer["name"])
+        for child, outers in zip(file_decls, _enclosing_declarations(file_decls)):
+            out.setdefault(child["name"], set()).update(outers)
 
-    # A quoted name (`` `Foo.bar `` or ``` ``Foo.bar ```) is looked up when the
-    # code runs, in the environment of whichever module uses it, not of the
-    # module that wrote it: `resolveConst? `FourColor.contractProg` inside a
-    # command elaborator (PALOMAR-2026-09-27-000005). Exact full names are
-    # matched against every project declaration, without the visibility filter.
-    all_names = {str(decl["name"]) for decl in decls}
-    for d in decls:
-        path = mod_path.get(d["module"])
-        cached_lines = source_lines_by_path.get(path) if path else None
-        if d["start_line"] is None or cached_lines is None:
-            continue
-        code_lines, namespace_contexts = cached_lines[1], cached_lines[2]
-        start_line = int(d["start_line"])
-        span = "\n".join(code_lines[start_line - 1 : int(d["end_line"])])
-        for match in _QUOTED_NAME_RE.finditer(span):
-            name = match.group(1).removeprefix("_root_.")
-            # ``Foo resolves through the enclosing namespaces when it is written.
-            line = start_line + span.count("\n", 0, match.start())
-            candidates = (_namespace_name_candidates(name, namespace_contexts.get(line, ""))
-                          if match.group(0).startswith("``") else [name])
-            hit = next((candidate for candidate in candidates if candidate in all_names), None)
-            if hit is not None and hit != d["name"]:
-                out.setdefault(d["name"], set()).add(hit)
+    for index, d in enumerate(decls):
+        for hit in quoted_edges.get(index, ()):
+            out.setdefault(d["name"], set()).add(hit)
     return out
 
 
@@ -526,6 +607,22 @@ _KIND_KW_RE = re.compile(
     re.MULTILINE)
 
 
+def _decls_by_path(
+    decls: list[DeclRange], mod_path: dict[str, str]
+) -> dict[str | None, list[DeclRange]]:
+    """Declarations grouped by their module's source path, in order.
+
+    The detectors below split (and mask) a file once for all of its
+    declarations instead of once per declaration, which is quadratic for
+    generated files of thousands of declarations (PALOMAR-2026-10-22-000009).
+    """
+
+    grouped: dict[str | None, list[DeclRange]] = {}
+    for decl in decls:
+        grouped.setdefault(mod_path.get(decl["module"]), []).append(decl)
+    return grouped
+
+
 def detect_automation_tagged(
     decls: list[DeclRange],
     originals: dict[str, str],
@@ -537,39 +634,42 @@ def detect_automation_tagged(
     `attribute [...] name` commands, including multiline target lists.
     """
     out: set[str] = set()
-
-    for d in decls:
-        if d["start_line"] is None:
-            continue
-        path = mod_path.get(d["module"])
+    # Split and mask each file once: doing it per declaration was quadratic,
+    # and a 21,000-declaration project spent hours here (PALOMAR-2026-10-22-000008).
+    for path, path_decls in _decls_by_path(decls, mod_path).items():
         if not path or path not in originals:
             continue
         lines = originals[path].split("\n")
-        start, end = int(d["start_line"]), min(len(lines), int(d["end_line"]))
-        # The decl's own command span (attributes only appear as `@[...]`
-        # annotations, never inside tactic blocks, so a body `by simp` is safe).
-        # The range includes a leading docstring, so an `@[simp]` between the
-        # docstring and keyword is in-span.
-        span = "\n".join(lines[start - 1:end])
-        if _ATTR_TAG_RE.search(span):
-            out.add(d["name"])
-            continue
-        # A declaration an `attribute` command generates, whose range is the
-        # command itself: `attribute [reassoc (attr := simp)] pD_idem` adds
-        # `pD_idem_assoc`. Dropping it deleted the command, and with it the
-        # simp attribute on `pD_idem` (PALOMAR-2026-10-16-000006).
-        payloads = _attribute_command_payloads(span)
-        if payloads and not all(_is_prefix_attribute(payload) for payload in payloads):
-            out.add(d["name"])
-            continue
-        # Plus a standalone, possibly multiline `@[...]` block directly
-        # above the declaration range (the range may start at its docstring).
-        code_lines = _mask_comments_preserve_layout(originals[path]).split("\n")
-        j = start - 1
-        while j >= 1 and code_lines[j - 1].strip() == "":
-            j -= 1
-        if _attribute_block_start(code_lines, j) is not None:
-            out.add(d["name"])
+        code_lines: list[str] | None = None
+        for d in path_decls:
+            if d["start_line"] is None:
+                continue
+            start, end = int(d["start_line"]), min(len(lines), int(d["end_line"]))
+            # The decl's own command span (attributes only appear as `@[...]`
+            # annotations, never inside tactic blocks, so a body `by simp` is safe).
+            # The range includes a leading docstring, so an `@[simp]` between the
+            # docstring and keyword is in-span.
+            span = "\n".join(lines[start - 1:end])
+            if _ATTR_TAG_RE.search(span):
+                out.add(d["name"])
+                continue
+            # A declaration an `attribute` command generates, whose range is the
+            # command itself: `attribute [reassoc (attr := simp)] pD_idem` adds
+            # `pD_idem_assoc`. Dropping it deleted the command, and with it the
+            # simp attribute on `pD_idem` (PALOMAR-2026-10-16-000006).
+            payloads = _attribute_command_payloads(span)
+            if payloads and not all(_is_prefix_attribute(payload) for payload in payloads):
+                out.add(d["name"])
+                continue
+            # Plus a standalone, possibly multiline `@[...]` block directly
+            # above the declaration range (the range may start at its docstring).
+            if code_lines is None:
+                code_lines = _mask_comments_preserve_layout(originals[path]).split("\n")
+            j = start - 1
+            while j >= 1 and code_lines[j - 1].strip() == "":
+                j -= 1
+            if _attribute_block_start(code_lines, j) is not None:
+                out.add(d["name"])
 
     out.update(detect_attribute_command_roots(decls, originals))
     return out
@@ -671,21 +771,21 @@ def detect_opaque_environment_command_roots(
     """
 
     out: set[str] = set()
-    for decl in decls:
-        if decl.get("start_line") is None or decl.get("end_line") is None:
-            continue
-        path = mod_path.get(decl["module"])
+    for path, path_decls in _decls_by_path(decls, mod_path).items():
         text = originals.get(path) if path else None
         if text is None:
             continue
         lines = text.split("\n")
-        start = max(1, int(decl["start_line"]))
-        end = min(len(lines), int(decl["end_line"]))
-        span = "\n".join(lines[start - 1:end])
-        if _OPAQUE_ENVIRONMENT_COMMAND_RE.search(
-            _mask_comments_preserve_layout(span)
-        ):
-            out.add(decl["name"])
+        for decl in path_decls:
+            if decl.get("start_line") is None or decl.get("end_line") is None:
+                continue
+            start = max(1, int(decl["start_line"]))
+            end = min(len(lines), int(decl["end_line"]))
+            span = "\n".join(lines[start - 1:end])
+            if _OPAQUE_ENVIRONMENT_COMMAND_RE.search(
+                _mask_comments_preserve_layout(span)
+            ):
+                out.add(decl["name"])
     return out
 
 
@@ -864,16 +964,38 @@ def _source_namespace_resolution_contexts(
     return namespaces_by_line, opens_by_line
 
 
+def _dotted_prefix_index(declarations: Iterable[str]) -> dict[str, list[str]]:
+    """Each name under every text before one of its dots: ``A.B.c`` under
+    ``A`` and ``A.B``, so the names that start with ``ns + "."`` are
+    ``index[ns]``."""
+
+    index: dict[str, list[str]] = {}
+    for name in declarations:
+        dot = name.find(".")
+        while dot != -1:
+            index.setdefault(name[:dot], []).append(name)
+            dot = name.find(".", dot + 1)
+    return index
+
+
 def _resolve_project_namespace_members(
     namespace: str,
     declarations: set[str],
     lexical_namespace: str,
+    prefix_index: dict[str, list[str]] | None = None,
 ) -> set[str]:
-    """Resolve a namespace only by Lean's exact lexical prefixes."""
+    """Resolve a namespace only by Lean's exact lexical prefixes.
+
+    ``prefix_index`` (``_dotted_prefix_index(declarations)``) answers the same
+    without scanning every declaration, for callers that resolve many.
+    """
 
     for candidate in _namespace_name_candidates(namespace, lexical_namespace):
-        prefix = candidate + "."
-        members = {name for name in declarations if name.startswith(prefix)}
+        if prefix_index is not None:
+            members = set(prefix_index.get(candidate, ()))
+        else:
+            prefix = candidate + "."
+            members = {name for name in declarations if name.startswith(prefix)}
         if members:
             return members
     return set()
@@ -1130,6 +1252,9 @@ def detect_open_namespace_roots(
     """
 
     names = {d["name"] for d in decls}
+    # Thousands of files' `open`s, each resolved against every declaration,
+    # were quadratic (PALOMAR-2026-10-21-000025).
+    prefix_index = _dotted_prefix_index(names)
     roots: set[str] = set()
     for text in originals.values():
         masked = _mask_comments_preserve_layout(text)
@@ -1148,7 +1273,7 @@ def detect_open_namespace_roots(
             for namespace in tokens:
                 roots.update(
                     _resolve_project_namespace_members(
-                        namespace, names, lexical_namespace
+                        namespace, names, lexical_namespace, prefix_index
                     )
                 )
     return roots
@@ -1421,22 +1546,22 @@ def detect_force_keep_kinds(
     A standalone `deriving instance C for T` command counts as an instance; a
     `deriving` clause on a type is part of that type's range and goes with it."""
     out: set[str] = set()
-    for d in decls:
-        if d["start_line"] is None:
-            continue
-        path = mod_path.get(d["module"])
+    for path, path_decls in _decls_by_path(decls, mod_path).items():
         if not path or path not in originals:
             continue
         lines = originals[path].split("\n")
-        start, end = int(d["start_line"]), min(len(lines), int(d["end_line"]))
-        span = "\n".join(lines[start - 1:end])
-        if _KIND_KW_RE.search(span) or _INSTANCE_ATTR_RE.search(span):
-            out.add(d["name"])
-        elif ".Simps." in "." + str(d["name"]):
-            # Custom `@[simps]` projections (`Foo.Simps.apply`) are found by
-            # name when `initialize_simps_projections Foo` runs; dropping one
-            # silently changes every lemma `@[simps]` generates for `Foo`.
-            out.add(d["name"])
+        for d in path_decls:
+            if d["start_line"] is None:
+                continue
+            start, end = int(d["start_line"]), min(len(lines), int(d["end_line"]))
+            span = "\n".join(lines[start - 1:end])
+            if _KIND_KW_RE.search(span) or _INSTANCE_ATTR_RE.search(span):
+                out.add(d["name"])
+            elif ".Simps." in "." + str(d["name"]):
+                # Custom `@[simps]` projections (`Foo.Simps.apply`) are found by
+                # name when `initialize_simps_projections Foo` runs; dropping one
+                # silently changes every lemma `@[simps]` generates for `Foo`.
+                out.add(d["name"])
     return out
 
 
@@ -1451,12 +1576,15 @@ def collect_implicit_dependency_roots(
     name references in a theorem's kernel term.
     """
 
+    from lean_strip._pipeline.preprocessing import notation_roots as _notation_roots
+
     return {
         "attributed": detect_automation_tagged(decls, originals, mod_path),
         "implicit_kinds": detect_force_keep_kinds(decls, originals, mod_path)
         | detect_open_hiding_roots(decls, originals)
         | detect_open_renaming_roots(decls, originals)
-        | detect_run_command_roots(decls, originals),
+        | detect_run_command_roots(decls, originals)
+        | _notation_roots.detect_notation_body_roots(decls, originals),
         "open_namespace_candidates": detect_open_namespace_roots(
             decls, originals
         ),

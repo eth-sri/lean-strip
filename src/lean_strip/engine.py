@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from lean_strip._pipeline.preprocessing import comparator_closure
 from lean_strip._pipeline.preprocessing import contract as preprocessing_contract
 from lean_strip._pipeline.preprocessing import frontend
 from lean_strip._pipeline.preprocessing import strip as lean_strip
@@ -67,6 +68,12 @@ class StripSettings:
     stack_kib: int = 32768
     file_workers: int = 8
     clean_certify: bool = False
+    # Stop after the dependency graph and write it (lean-strip --graph-only).
+    graph_only: bool = False
+    # The comparator config's names (`protected` is their union).
+    theorem_names: tuple[str, ...] = ()
+    definition_names: tuple[str, ...] = ()
+    permitted_axioms: tuple[str, ...] = ()
 
 
 @dataclass
@@ -76,6 +83,7 @@ class StripResult:
     decls: list[dict[str, Any]] = field(default_factory=list)
     module_paths: dict[str, str] = field(default_factory=dict)
     discarded: bool = False
+    graph_only: bool = False
 
 
 Stage = Callable[[str], Any]
@@ -570,6 +578,60 @@ def _names_in_environment(
     return found
 
 
+_GENERATED_COMPONENT_RE = re.compile(r"^(?:_[A-Za-z].*|match_\d+|eq_\d+|eq_def|proof_\d+)$")
+
+
+def _generated_owner(name: str, declared: set[str]) -> str | None:
+    """The declaration a generated helper such as ``foo._proof_1`` belongs to.
+
+    Only names whose trailing components are all generated (``_proof_1``,
+    ``match_2``, ``eq_1``, ...) count; the owner is the longest declared prefix.
+    """
+
+    parts = name.split(".")
+    for cut in range(len(parts) - 1, 0, -1):
+        if not all(_GENERATED_COMPONENT_RE.match(part) for part in parts[cut:]):
+            return None
+        owner = ".".join(parts[:cut])
+        if owner in declared:
+            return owner
+    return None
+
+
+def _comparator_realization_roots(
+    ws: LocalWorkspace,
+    settings: StripSettings,
+    decls: list[dict],
+    module_names: set[str],
+    timeout: int,
+) -> tuple[set[str], dict[str, Any] | None]:
+    """The declarations that realized constants the comparator compares exactly.
+
+    See comparator_closure.py. Only configs with ``definition_names`` get
+    them (PALOMAR-2026-10-20-000013); a theorem-only config keeps the strip it
+    had, and nothing runs for it. A failed query fails the run.
+    """
+
+    if not settings.definition_names:
+        return set(), None
+    try:
+        compared, reach = comparator_closure.collect_comparator_closure(
+            ws,
+            entry_module=settings.entry_module,
+            project_modules=module_names | {str(d["module"]) for d in decls},
+            theorem_names=settings.theorem_names,
+            definition_names=settings.definition_names,
+            permitted_axioms=settings.permitted_axioms,
+            timeout=timeout,
+        )
+    except RuntimeError as error:
+        raise StripFailure("comparator_closure", str(error)) from error
+    plan = comparator_closure.plan_realization_roots(
+        compared, comparator_closure.realization_sites(reach), {str(d["name"]) for d in decls},
+    )
+    return plan["roots"], plan["report"]
+
+
 def _list_project_lean_files(ws: LocalWorkspace) -> list[str]:
     """Project ``.lean`` files as ``/testbed/...`` paths, in byte order."""
 
@@ -900,6 +962,26 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             f"source {len(graph.edge_layers['source_text'])})"
         )
     timing["decl_graph"] = _t.seconds
+    if settings.graph_only:
+        report["dependency_evidence"] = graph.evidence
+        payload = build_graph_artifact(
+            repository=ws.root.name,
+            source_image="local",
+            source_image_id="local",
+            declarations=[dict(row) for row in decls],
+            kernel_edges=set(graph.edge_layers.get("kernel", set())),
+            ilean_edges=set(graph.edge_layers.get("ilean", set())),
+            source_text_edges=set(graph.edge_layers.get("source_text", set())),
+            reports={"production": report},
+            originals=dict(originals),
+            module_paths=dict(graph.module_paths),
+        )
+        payload["graph_method"] = METHOD
+        payload["sha256"] = graph_sha256(payload)
+        write_graph_artifact(settings.diagnostics_dir / "dependency-graph.json", payload)
+        timing["total"] = round(time.perf_counter() - started, 1)
+        return StripResult(report, dict(originals), decls=[dict(row) for row in decls],
+                           module_paths=dict(graph.module_paths), graph_only=True)
     if not decls:
         report["discarded"] = True
         report["discard"] = {
@@ -922,6 +1004,16 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         report["seed_from_dependencies"] = sorted(from_dependencies)
         missing_seeds -= from_dependencies
         seed -= from_dependencies
+    # A generated helper (`foo._proof_1`, `foo.match_2`) has no source range;
+    # a comparator config may still list it (PALOMAR-2026-10-21-000010). It
+    # is part of the declaration it is named under, so seed that one.
+    declared = {str(d["name"]) for d in decls}
+    owners_of_generated = {name: owner for name in missing_seeds
+                           if (owner := _generated_owner(name, declared)) is not None}
+    if owners_of_generated:
+        report["seed_generated_owners"] = dict(sorted(owners_of_generated.items()))
+        missing_seeds -= set(owners_of_generated)
+        seed = (seed - set(owners_of_generated)) | set(owners_of_generated.values())
     report["seed_unresolved"] = sorted(missing_seeds)
     if missing_seeds:
         raise StripFailure(
@@ -953,6 +1045,12 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             & {str(d["name"]) for d in decls}
         )
         exact_environment_roots |= set(report["shadowed_owner_roots"])
+        realization_roots, closure_report = _comparator_realization_roots(
+            ws, settings, decls, set(graph.module_paths), timeout,
+        )
+        if closure_report is not None:
+            report["comparator_closure"] = closure_report
+        exact_environment_roots |= realization_roots
         retention = lean_strip.plan_source_retention(
             decls, originals, mod_path,
             set(normalization.get("retained_failed_files", [])),
@@ -968,6 +1066,8 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             f"{len(exact_environment_roots)} environment roots "
             f"(instances/attributes/syntax), {len(command_roots)} command roots, "
             f"{len(retain_exact_files)} files retained whole"
+            + (f", {len(realization_roots)} realization sites of compared constants"
+               if settings.definition_names else "")
         )
     timing["roots"] = _t.seconds
 
