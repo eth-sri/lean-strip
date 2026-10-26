@@ -24,6 +24,9 @@ from lean_strip._pipeline.preprocessing import comparator_closure
 from lean_strip._pipeline.preprocessing import contract as preprocessing_contract
 from lean_strip._pipeline.preprocessing import frontend
 from lean_strip._pipeline.preprocessing import strip as lean_strip
+from lean_strip._pipeline.preprocessing.identity import (
+    DeclId, DeclarationIndex, decl_id, identity_rows,
+)
 from lean_strip._pipeline.preprocessing.examples import collect_anonymous_example_ranges
 from lean_strip._pipeline.preprocessing.dependency_graph import (
     METHOD,
@@ -523,16 +526,32 @@ def _fallback_summary(fallback: dict[str, Any]) -> str:
 
 def _forget_restored_drops(
     report: dict[str, Any], fallback: dict[str, Any],
-    decl_modules: dict[str, str], module_paths: dict[str, str],
+    decl_modules: dict[DeclId, str] | dict[str, str], module_paths: dict[str, str],
 ) -> None:
     """Keep the report honest: declarations in restored files were not dropped."""
 
+    identities = {key for key in decl_modules if isinstance(key, tuple)}
+    if identities:
+        restored = set(fallback["grind_restored_files"])
+        restored_ids = {key for key in identities
+                        if module_paths.get(key[0]) in restored}
+        index = DeclarationIndex({"module": m, "name": n} for m, n in identities)
+        for exact_key, legacy_key in (("dropped_declaration_identities", "dropped_decls"),
+                                      ("module_pruned_declaration_identities", "module_pruned_declarations")):
+            remaining = index.select(report.get(exact_key, [])) - restored_ids
+            report[exact_key] = identity_rows(remaining)
+            report[legacy_key] = sorted({name for _module, name in remaining})
+        kept = index.select(report.get("kept_declaration_identities", [])) | restored_ids
+        report["kept_declaration_identities"] = identity_rows(kept)
+        report["kept_declarations"] = sorted({name for _module, name in kept})
+        report["keep_decls"] = len(kept)
     restored = set(fallback["grind_restored_files"])
-    for key in ("dropped_decls", "module_pruned_declarations"):
-        report[key] = [
-            name for name in report.get(key, [])
-            if module_paths.get(decl_modules.get(name, "")) not in restored
-        ]
+    if not identities:
+        for key in ("dropped_decls", "module_pruned_declarations"):
+            report[key] = [
+                name for name in report.get(key, [])
+                if module_paths.get(decl_modules.get(name, "")) not in restored
+            ]
     pruning = report.get("module_pruning") or {}
     if "deleted_files" in pruning:
         pruning["deleted_files"] = [
@@ -581,6 +600,24 @@ def _names_in_environment(
 _GENERATED_COMPONENT_RE = re.compile(r"^(?:_[A-Za-z].*|match_\d+|eq_\d+|eq_def|proof_\d+)$")
 
 
+def _seed_identities(
+    ws: LocalWorkspace, entry_module: str, seed: set[str],
+    declaration_index: DeclarationIndex, timeout: int,
+) -> set[DeclId]:
+    duplicate_seeds = {name for name in seed if len(declaration_index.resolve(name)) > 1}
+    seed_owners = (_names_in_environment(ws, entry_module, duplicate_seeds, timeout)
+                   if duplicate_seeds else {})
+    seed_ids: set[DeclId] = set()
+    for name in seed:
+        candidates = declaration_index.resolve(name)
+        if len(candidates) > 1:
+            candidates = declaration_index.resolve((seed_owners.get(name, ""), name))
+            if not candidates:
+                raise StripFailure("graph_seed_gate", f"ambiguous protected declaration: {name}")
+        seed_ids.update(candidates)
+    return seed_ids
+
+
 def _generated_owner(name: str, declared: set[str]) -> str | None:
     """The declaration a generated helper such as ``foo._proof_1`` belongs to.
 
@@ -604,7 +641,7 @@ def _comparator_realization_roots(
     decls: list[dict],
     module_names: set[str],
     timeout: int,
-) -> tuple[set[str], dict[str, Any] | None]:
+) -> tuple[set[DeclId], dict[str, Any] | None]:
     """The declarations that realized constants the comparator compares exactly.
 
     See comparator_closure.py. Only configs with ``definition_names`` get
@@ -629,7 +666,11 @@ def _comparator_realization_roots(
     plan = comparator_closure.plan_realization_roots(
         compared, comparator_closure.realization_sites(reach), {str(d["name"]) for d in decls},
     )
-    return plan["roots"], plan["report"]
+    index = DeclarationIndex(decls)
+    physical = {(module, name) for by_module in comparator_closure.realization_sites(reach).values()
+                for module, name in by_module.items() if (module, name) in index.identities}
+    plan["report"]["site_root_identities"] = identity_rows(physical)
+    return physical, plan["report"]
 
 
 def _list_project_lean_files(ws: LocalWorkspace) -> list[str]:
@@ -963,6 +1004,13 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         )
     timing["decl_graph"] = _t.seconds
     if settings.graph_only:
+        index = DeclarationIndex(decls)
+        graph_seeds = {name if name in index.by_name else _generated_owner(name, set(index.by_name))
+                       for name in seed}
+        report["protected_declaration_identities"] = identity_rows(_seed_identities(
+            ws, settings.entry_module, {name for name in graph_seeds if name}, index, timeout,
+        ))
+        report["kept_declaration_identities"] = identity_rows(index.identities)
         report["dependency_evidence"] = graph.evidence
         payload = build_graph_artifact(
             repository=ws.root.name,
@@ -973,6 +1021,10 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             ilean_edges=set(graph.edge_layers.get("ilean", set())),
             source_text_edges=set(graph.edge_layers.get("source_text", set())),
             reports={"production": report},
+            ambiguous_targets={
+                "source_text": graph.evidence.get("source_text_ambiguous_targets", []),
+                "ilean": graph.evidence.get("ilean", {}).get("ambiguous_targets", []),
+            },
             originals=dict(originals),
             module_paths=dict(graph.module_paths),
         )
@@ -1021,6 +1073,10 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             "protected names are not project declarations: " + ", ".join(sorted(missing_seeds)),
         )
 
+    declaration_index = DeclarationIndex(decls)
+    seed = _seed_identities(ws, settings.entry_module, seed, declaration_index, timeout)
+    report["protected_declaration_identities"] = identity_rows(seed)
+
     mod_path = graph.module_paths
     unresolved = {d["module"] for d in decls} - set(mod_path)
     if len(unresolved) > len(mod_path):
@@ -1038,28 +1094,30 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         implicit_roots = lean_strip.collect_implicit_dependency_roots(decls, originals, mod_path)
         attributed_roots = implicit_roots["attributed"]
         force_kinds = implicit_roots["implicit_kinds"]
-        exact_environment_roots = attributed_roots | force_kinds
+        exact_environment_roots = declaration_index.select(attributed_roots | force_kinds)
         # What redeclared dependency theorems use (see ilean.py).
         report["shadowed_owner_roots"] = sorted(
             set((graph.evidence or {}).get("ilean", {}).get("shadowed_owner_targets", []))
             & {str(d["name"]) for d in decls}
         )
-        exact_environment_roots |= set(report["shadowed_owner_roots"])
+        exact_environment_roots |= declaration_index.select(
+            graph.evidence.get("ilean", {}).get("shadowed_owner_targets_identities", [])
+        )
         realization_roots, closure_report = _comparator_realization_roots(
             ws, settings, decls, set(graph.module_paths), timeout,
         )
         if closure_report is not None:
             report["comparator_closure"] = closure_report
-        exact_environment_roots |= realization_roots
+        exact_environment_roots |= declaration_index.select(realization_roots)
         retention = lean_strip.plan_source_retention(
             decls, originals, mod_path,
             set(normalization.get("retained_failed_files", [])),
         )
         retain_exact_files = retention["retain_exact_files"]
         retain_exact_modules = retention["retain_exact_modules"]
-        retain_exact_decls = retention["retain_exact_declarations"]
+        retain_exact_decls = declaration_index.select(retention["retain_exact_declarations"])
         environment_files = retention["preserve_command_files"]
-        command_roots = retention["environment_command_roots"]
+        command_roots = declaration_index.select(retention["environment_command_roots"])
         report["failed_grind_retained_files"] = sorted(retain_exact_files)
         report["environment_command_files"] = sorted(environment_files)
         _t.note(
@@ -1127,12 +1185,12 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         report["module_pruning"] = module_prune
         surviving_modules = {m for m, p in mod_path.items() if p in originals}
         decls = [d for d in decls if d["module"] in surviving_modules]
-        surviving_names = {d["name"] for d in decls}
+        surviving_names = {decl_id(d) for d in decls}
         if seed - surviving_names:
             raise StripFailure(
                 "module_prune",
                 "module pruning removed protected declarations: "
-                + ", ".join(sorted(seed - surviving_names)),
+                + ", ".join(map(str, sorted(seed - surviving_names))),
             )
         deps = {
             name: set(targets) & surviving_names
@@ -1159,14 +1217,15 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
 
     # 7. Declaration strip.
     roots = set(command_roots) | retain_exact_decls | exact_environment_roots
-    module_pruned = {str(r["name"]) for r in graph_declarations} - {str(r["name"]) for r in decls}
-    report["module_pruned_declarations"] = sorted(module_pruned)
+    module_pruned = {decl_id(r) for r in graph_declarations} - {decl_id(r) for r in decls}
+    report["module_pruned_declarations"] = sorted({name for _module, name in module_pruned})
+    report["module_pruned_declaration_identities"] = identity_rows(module_pruned)
 
     # Lean's own view of the files the strip changes (frontend.py), by path.
     syntax: dict[str, frontend.FileSyntax] = {}
-    keep_sets: dict[frozenset[str], set[str]] = {}
+    keep_sets: dict[frozenset[DeclId], set[DeclId]] = {}
 
-    def keep_set(extra_roots: set[str]) -> set[str]:
+    def keep_set(extra_roots: set[DeclId]) -> set[DeclId]:
         """The keep-set with ``extra_roots``, and the namespaces surviving `open`s need."""
 
         key = frozenset(extra_roots)
@@ -1181,7 +1240,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             keep_sets[key] = keep
         return set(keep_sets[key])
 
-    def plan_strip(extra_roots: set[str]) -> tuple[set[str], dict[str, str], dict[str, Any]]:
+    def plan_strip(extra_roots: set[DeclId]) -> tuple[set[DeclId], dict[str, str], dict[str, Any]]:
         """The keep-set and stripped sources, keeping ``extra_roots`` as well."""
 
         keep = keep_set(extra_roots)
@@ -1200,11 +1259,12 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         desired, silenced = _silence_private_only_modules(desired, originals, rows, mod_path)
         report["private_module_lint_silenced"] = silenced
         report["keep_decls"] = len(keep)
-        report["kept_declarations"] = sorted(keep)
+        report["kept_declarations"] = sorted({name for _module, name in keep})
+        report["kept_declaration_identities"] = identity_rows(keep)
         report["strip"] = strip_summary
-        report["dropped_decls"] = sorted(
-            {d["name"] for d in decls if d["name"] not in keep} | module_pruned
-        )
+        dropped = {decl_id(d) for d in decls if decl_id(d) not in keep} | module_pruned
+        report["dropped_decls"] = sorted({name for _module, name in dropped})
+        report["dropped_declaration_identities"] = identity_rows(dropped)
         return keep, desired, strip_summary
 
     # 7a. Lean's own parse, scopes and name resolution for the files the
@@ -1249,7 +1309,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
                 f"{strip_summary['unresolved_drops']} dropped declaration(s) have unresolved module paths",
             )
         _t.note(
-            f"keep {len(keep)} / drop {len(report['dropped_decls'])} declarations; "
+            f"keep {len(keep)} / drop {len(report['dropped_declaration_identities'])} declarations; "
             f"{changed} file(s) changed"
         )
     timing["strip"] = _t.seconds
@@ -1273,9 +1333,10 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             (settings.diagnostics_dir / "failed-final-build.log").write_text(output)
             # What the strip decided, to explain the failure afterwards.
             (settings.diagnostics_dir / "strip-plan.json").write_text(json.dumps({
-                "seed": sorted(seed), "roots": sorted(roots),
-                "kept": sorted(keep), "dropped": report.get("dropped_decls", []),
-                "dependencies": {name: sorted(targets) for name, targets in deps.items() if targets},
+                "seed": identity_rows(seed), "roots": identity_rows(roots),
+                "kept": identity_rows(keep), "dropped": report.get("dropped_declaration_identities", []),
+                "dependencies": [{"source": identity_rows([name])[0], "targets": identity_rows(targets)}
+                                 for name, targets in sorted(deps.items()) if targets],
             }, indent=1))
         if not ok and not os.environ.get("LEAN_STRIP_NO_BUILD_FALLBACK"):
             fallback = _recover_build(ws, build_target, timeout, raw_originals, output, _t)
@@ -1293,7 +1354,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
             if fallback["grind_restored_files"]:
                 _forget_restored_drops(
                     report, fallback,
-                    {str(row["name"]): str(row["module"]) for row in graph_declarations},
+                    {decl_id(row): str(row["module"]) for row in graph_declarations},
                     graph_module_paths,
                 )
                 _t.note("stripped tree did not build; " + _fallback_summary(fallback))
@@ -1330,6 +1391,10 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         ilean_edges=set(graph.edge_layers.get("ilean", set())),
         source_text_edges=set(graph.edge_layers.get("source_text", set())),
         reports={"production": report},
+        ambiguous_targets={
+            "source_text": graph.evidence.get("source_text_ambiguous_targets", []),
+            "ilean": graph.evidence.get("ilean", {}).get("ambiguous_targets", []),
+        },
         originals=graph_originals,
         module_paths=graph_module_paths,
     )

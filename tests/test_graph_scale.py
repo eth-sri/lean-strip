@@ -110,7 +110,7 @@ def test_resolution_by_last_component_matches_the_module_scan():
             module: {".".join(rng.choice(components) for _ in range(rng.randint(1, 4))) for _ in range(8)}
             for module in ("M", "N")
         }
-        names = set().union(*names_by_module.values())
+        names = {(module, name) for module, values in names_by_module.items() for name in values}
         names_by_last = {}
         for module, module_names in names_by_module.items():
             for name in module_names:
@@ -118,13 +118,13 @@ def test_resolution_by_last_component_matches_the_module_scan():
         for _ in range(10):
             raw = ".".join(rng.choice(components) for _ in range(rng.randint(1, 3)))
             module = rng.choice(("M", "N", "O"))
-            if raw in names:
-                expected = {raw}
-            elif f"{module}.{raw}" in names:
-                expected = {f"{module}.{raw}"}
+            if (module, raw) in names:
+                expected = {(module, raw)}
+            elif (module, f"{module}.{raw}") in names:
+                expected = {(module, f"{module}.{raw}")}
             else:
                 last = raw.rsplit(".", 1)[-1]
-                expected = {name for name in names_by_module.get(module, set())
+                expected = {(module, name) for name in names_by_module.get(module, set())
                             if name == raw or name.endswith("." + raw) or name.rsplit(".", 1)[-1] == last}
             assert ilean._resolve_in_module(raw, module, names, names_by_last) == expected
 

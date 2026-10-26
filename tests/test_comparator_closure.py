@@ -133,7 +133,7 @@ def test_definition_configs_root_the_sites():
     roots, report = engine._comparator_realization_roots(
         ws, _settings(theorem_names=("thm",), definition_names=("dfn",)), decls, {"Sol"}, 60,
     )
-    assert roots == {"cursor_guard_projection"}
+    assert roots == {("Traversal", "cursor_guard_projection")}
     assert report["realized_by_other_declarations"] == {
         "W.walkEvents.eq_1": ["cursor_guard_projection"],
     }

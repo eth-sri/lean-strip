@@ -202,7 +202,7 @@ def test_quoted_names_link_across_modules_without_imports():
                  "/testbed/CfContract.lean": "def FourColor.contractProg := 1\ndef FourColor.other := 2"}
     mod_path = {"Gen": "/testbed/Gen.lean", "CfContract": "/testbed/CfContract.lean"}
     deps = strip.augment_deps_with_source(decls, {}, originals, mod_path)
-    assert {"FourColor.contractProg", "FourColor.other"} <= deps["certify"]
+    assert {("CfContract", "FourColor.contractProg"), ("CfContract", "FourColor.other")} <= deps[("Gen", "certify")]
 
 
 
@@ -545,7 +545,7 @@ def test_an_open_keeps_the_imported_anchor_of_its_namespace():
     decls = [{"name": "S.Section8.anchor", "module": "S.Anchor"},
              {"name": "S.Section8.solution", "module": "S.Use"}]
     paths = {"S.Anchor": "/testbed/S/Anchor.lean", "S.Use": "/testbed/S/Use.lean"}
-    assert strip.namespace_anchor_roots(originals, decls, {"S.Section8.solution"}, paths) == {"S.Section8.anchor"}
+    assert strip.namespace_anchor_roots(originals, decls, {"S.Section8.solution"}, paths) == {("S.Anchor", "S.Section8.anchor")}
     # Not needed once the file keeps nothing of the namespace itself.
     assert strip.namespace_anchor_roots(originals, decls, set(), paths) == set()
 

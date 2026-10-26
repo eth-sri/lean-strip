@@ -86,6 +86,18 @@ The 1.1.2 validation snapshot covers all **739 results** at Palomar registry rev
 
 The runs removed **36.0% of Lean tokens overall**, with 29.5% removed per result on average and a median of 19.4%. The graph optimizations passed 35 differential regression runs with matching graphs and artifacts. See [the per-result counts, verdicts and runtimes](RESULTS.md).
 
+The diagnostic `dependency-graph.json` uses schema `preprocessing_dependency_graph_v3`.
+Declarations are identified by `(module, full Lean name)` throughout extraction,
+reachability and reporting, so independently built modules can provide separate
+copies of the same name with different dependencies and statuses. Kernel extraction
+queries each module in its own environment; `.ilean` references retain their defining
+module. Edges use indexes into the physical `nodes` array. `ambiguous_edges` records
+source and target candidate indexes plus the evidence bitmask when a reference has
+multiple possible providers. Static discovery conservatively retains candidate targets;
+legacy name-only export edges are recorded as ambiguous instead of selecting a provider.
+Policy reports include authoritative `{module, name}` identity records alongside the
+legacy name lists.
+
 ## License
 
 MIT; see [LICENSE](LICENSE).

@@ -18,6 +18,8 @@ from typing import Any, Iterable, Mapping
 from lean_strip._pipeline.preprocessing.olean import DeclRange
 from lean_strip._pipeline.preprocessing.strip import module_to_relpath
 
+from .identity import DeclId, Dependencies, Edge, DeclarationIndex, decl_id, identity_rows
+
 
 SUPPORTED_ILEAN_VERSIONS = frozenset({3, 4, 5})
 
@@ -56,20 +58,16 @@ def _span_key(decl: DeclRange) -> tuple[int, int, int]:
 def _resolve_in_module(
     raw_name: str,
     module: str,
-    names: set[str],
+    names: set[DeclId],
     names_by_last: Mapping[str, Mapping[str, set[str]]],
-) -> set[str]:
-    """``raw_name`` as a project name, else the names of ``module`` that are
-    ``raw_name``, end in ``.raw_name`` or share its last component; the first
-    two imply the third, so ``names_by_last`` (module -> last component ->
-    names) answers it without scanning the module."""
-
-    if raw_name in names:
-        return {raw_name}
+) -> set[DeclId]:
+    """Resolve within the defining module, using the shared last-name index."""
+    if (module, raw_name) in names:
+        return {(module, raw_name)}
     qualified = f"{module}.{raw_name}" if module else raw_name
-    if qualified in names:
-        return {qualified}
-    return set(names_by_last.get(module, {}).get(raw_name.rsplit(".", 1)[-1], ()))
+    if (module, qualified) in names:
+        return {(module, qualified)}
+    return {(module, name) for name in names_by_last.get(module, {}).get(raw_name.rsplit(".", 1)[-1], ())}
 
 
 class _ModuleRanges:
@@ -121,14 +119,14 @@ def _positional_owners(
     source_module: str,
     usage: list[Any],
     ranges_by_module: Mapping[str, _ModuleRanges],
-) -> set[str]:
+) -> set[DeclId]:
     ranges = ranges_by_module.get(source_module)
     candidates = ranges.containing(usage) if ranges is not None else []
     if not candidates:
         return set()
     narrowest = min(_span_key(decl) for decl in candidates)
     return {
-        str(decl["name"])
+        decl_id(decl)
         for decl in candidates
         if _span_key(decl) == narrowest
     }
@@ -137,10 +135,10 @@ def _positional_owners(
 def union_ilean_documents(
     documents: Iterable[tuple[str, Mapping[str, Any]]],
     decls: list[DeclRange],
-    deps: Mapping[str, set[str]],
+    deps: Mapping[DeclId, set[DeclId]],
     *,
     modules: Iterable[str] | None = None,
-) -> tuple[dict[str, set[str]], dict[str, Any]]:
+) -> tuple[Dependencies, dict[str, Any]]:
     """Union project-local semantic reference edges from parsed ``.ilean`` JSON.
 
     Version 5 usage records carry their enclosing declaration name directly.
@@ -149,7 +147,7 @@ def union_ilean_documents(
     narrowest source range, the edge is added to the full tied owner set.
     """
 
-    names = {str(decl["name"]) for decl in decls}
+    names = {decl_id(decl) for decl in decls}
     requested_modules = set(modules or (str(decl["module"]) for decl in decls))
     names_by_last: dict[str, dict[str, set[str]]] = defaultdict(dict)
     decls_by_module: dict[str, list[DeclRange]] = defaultdict(list)
@@ -165,13 +163,13 @@ def union_ilean_documents(
     }
     del decls_by_module
 
-    out = {name: set(targets) for name, targets in deps.items()}
+    out = DeclarationIndex(decls).dependencies(deps)
     original_edges = {
         (source, target)
         for source, targets in out.items()
         for target in targets
     }
-    candidate_edges: set[tuple[str, str]] = set()
+    candidate_edges: set[Edge] = set()
     versions: Counter[int] = Counter()
     seen_modules: set[str] = set()
     unsupported_versions: set[int] = set()
@@ -182,16 +180,16 @@ def union_ilean_documents(
     # targets as roots unless the owner is Lean's generated `_example`: those
     # non-persistent validation commands are removed using Lean frontend
     # ranges (examples.py) instead of rooting everything they mention.
-    owner_unresolved_targets: set[str] = set()
+    owner_unresolved_targets: set[DeclId] = set()
     # Usages whose `.ilean` owner is a declaration the graph does not have: a
     # project redeclaration of a dependency's identical theorem, which import
     # attributes to the dependency (PALOMAR-2026-10-10-000001's copy of
     # mathlib's `HasIndepIncrements.isGaussianProcess`). Its text stays, so
     # what it uses must too.
-    shadowed_owner_targets: set[str] = set()
+    shadowed_owner_targets: set[DeclId] = set()
     anonymous_example_modules: set[str] = set()
-    anonymous_example_targets: set[str] = set()
-    anonymous_example_targets_by_module: dict[str, set[str]] = defaultdict(set)
+    anonymous_example_targets: set[DeclId] = set()
+    anonymous_example_targets_by_module: dict[str, set[DeclId]] = defaultdict(set)
     documents_seen = 0
     references_seen = 0
     constant_references = 0
@@ -199,6 +197,7 @@ def union_ilean_documents(
     named_owner_usages = 0
     positional_owner_usages = 0
     ambiguous_target_usages = 0
+    ambiguous_targets: list[dict[str, Any]] = []
     ambiguous_owner_usages = 0
     owner_mismatch_usages = 0
     owner_mismatches: set[str] = set()
@@ -253,7 +252,7 @@ def union_ilean_documents(
                 if not isinstance(usage, list) or len(usage) < 4:
                     malformed_usage_records += 1
                     continue
-                named_owners: set[str] = set()
+                named_owners: set[DeclId] = set()
                 raw_named_owner: str | None = None
                 if len(usage) >= 5 and isinstance(usage[4], str):
                     raw_named_owner = usage[4]
@@ -275,8 +274,8 @@ def union_ilean_documents(
                     owner_mismatch_usages += 1
                     owner_mismatches.add(
                         f"{module}:{usage[0]}:{usage[1]}:{target_name}:"
-                        f"named={','.join(sorted(named_owners))}:"
-                        f"positional={','.join(sorted(positional_owners))}"
+                        f"named={sorted(named_owners)!r}:"
+                        f"positional={sorted(positional_owners)!r}"
                     )
                 owners = named_owners | positional_owners
                 if not named_owners and positional_owners:
@@ -305,7 +304,10 @@ def union_ilean_documents(
                     continue
                 if len(owners) > 1:
                     ambiguous_owner_usages += 1
-                for owner in owners:
+                for owner in sorted(owners):
+                    if len(targets) > 1:
+                        ambiguous_targets.append({"source": {"module": owner[0], "name": owner[1]},
+                                                  "name": target_name, "candidates": identity_rows(targets)})
                     for target in targets:
                         if owner != target:
                             candidate_edges.add((owner, target))
@@ -315,7 +317,7 @@ def union_ilean_documents(
 
     added_edges = candidate_edges - original_edges
     report = {
-        "schema": "lean_ilean_reference_edges_v1",
+        "schema": "lean_ilean_reference_edges_v2",
         "supported_versions": sorted(SUPPORTED_ILEAN_VERSIONS),
         "schema_versions": {
             str(version): count for version, count in sorted(versions.items())
@@ -331,21 +333,25 @@ def union_ilean_documents(
         "named_owner_usages": named_owner_usages,
         "positional_owner_usages": positional_owner_usages,
         "ambiguous_target_usages": ambiguous_target_usages,
+        "ambiguous_targets": ambiguous_targets,
         "ambiguous_owner_usages": ambiguous_owner_usages,
         "owner_mismatch_usages": owner_mismatch_usages,
         "owner_mismatches": sorted(owner_mismatches),
         "malformed_usage_records": malformed_usage_records,
         "project_target_unresolved": sorted(project_target_unresolved),
         "owner_unresolved": sorted(owner_unresolved),
-        "owner_unresolved_targets": sorted(owner_unresolved_targets),
+        "owner_unresolved_targets": sorted({name for _module, name in owner_unresolved_targets}),
+        "owner_unresolved_targets_identities": identity_rows(owner_unresolved_targets),
         "owner_unresolved_target_count": len(owner_unresolved_targets),
-        "shadowed_owner_targets": sorted(shadowed_owner_targets),
+        "shadowed_owner_targets": sorted({name for _module, name in shadowed_owner_targets}),
+        "shadowed_owner_targets_identities": identity_rows(shadowed_owner_targets),
         "anonymous_example_modules": sorted(anonymous_example_modules),
         "anonymous_example_module_count": len(anonymous_example_modules),
-        "anonymous_example_targets": sorted(anonymous_example_targets),
+        "anonymous_example_targets": sorted({name for _module, name in anonymous_example_targets}),
+        "anonymous_example_targets_identities": identity_rows(anonymous_example_targets),
         "anonymous_example_target_count": len(anonymous_example_targets),
         "anonymous_example_targets_by_module": {
-            module: sorted(targets)
+            module: identity_rows(targets)
             for module, targets in sorted(
                 anonymous_example_targets_by_module.items()
             )
@@ -367,10 +373,10 @@ def module_to_ilean_relpath(module: str) -> str:
 def union_ilean_reference_edges(
     reader: Any,
     decls: list[DeclRange],
-    deps: Mapping[str, set[str]],
+    deps: Mapping[DeclId, set[DeclId]],
     *,
     modules: Iterable[str] | None = None,
-) -> tuple[dict[str, set[str]], dict[str, Any]]:
+) -> tuple[Dependencies, dict[str, Any]]:
     """Collect and union ``.ilean`` edges for one already-built project.
 
     ``reader.iter_ilean_documents(modules)`` yields ``(path, document)`` pairs

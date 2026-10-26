@@ -26,8 +26,10 @@ from __future__ import annotations
 import difflib
 import functools
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
+
+from .identity import DeclId, Dependencies, DeclarationIndex, decl_id, identity_rows
 
 DeclRange = dict[str, Any]
 
@@ -255,10 +257,12 @@ def _enclosing_declarations(file_decls: list[DeclRange]) -> list[list[str]]:
 
 def augment_deps_with_source(
     decls: list[DeclRange],
-    deps: dict[str, set[str]],
+    deps: Dependencies,
     originals: dict[str, str],
     mod_path: dict[str, str],
-) -> dict[str, set[str]]:
+    *,
+    ambiguities: list[dict[str, Any]] | None = None,
+) -> Dependencies:
     """Add dependency edges from SOURCE-level identifier references.
 
     `foldConsts` over the elaborated term misses declarations that a decl needs
@@ -496,10 +500,10 @@ def augment_deps_with_source(
             if hit is not None and hit != d["name"]:
                 quoted_edges.setdefault(index, []).append(hit)
 
-    out = {k: set(v) for k, v in deps.items()}
+    out: dict[DeclId, set[str]] = {}
     for index, d in enumerate(decls):
         if index in token_edges:
-            out.setdefault(d["name"], set()).update(token_edges[index])
+            out.setdefault(decl_id(d), set()).update(token_edges[index])
 
     # Lean exposes source-backed local declarations such as a `let rec`
     # helper as separate constants whose ranges are strictly nested inside the
@@ -517,12 +521,31 @@ def augment_deps_with_source(
 
     for file_decls in ranged_by_path.values():
         for child, outers in zip(file_decls, _enclosing_declarations(file_decls)):
-            out.setdefault(child["name"], set()).update(outers)
+            out.setdefault(decl_id(child), set()).update(outers)
 
+    declaration_index = DeclarationIndex(decls)
+    result = declaration_index.dependencies(deps)
+    current_module = None
+    visible_modules: set[str] = set()
+    for source, target_names in sorted(out.items()):
+        if current_module != source[0]:
+            current_module = source[0]
+            visible_modules = _closure(import_graph, {current_module})
+        for name in sorted(target_names):
+            targets = {target for target in declaration_index.resolve(name) if target[0] in visible_modules}
+            if len(targets) > 1 and ambiguities is not None:
+                ambiguities.append({"source": {"module": source[0], "name": source[1]},
+                                    "name": name, "candidates": identity_rows(targets)})
+            result.setdefault(source, set()).update(targets - {source})
     for index, d in enumerate(decls):
-        for hit in quoted_edges.get(index, ()):
-            out.setdefault(d["name"], set()).add(hit)
-    return out
+        source = decl_id(d)
+        for name in sorted(set(quoted_edges.get(index, ()))):
+            targets = declaration_index.resolve(name)
+            if len(targets) > 1 and ambiguities is not None:
+                ambiguities.append({"source": {"module": source[0], "name": source[1]},
+                                    "name": name, "candidates": identity_rows(targets)})
+            result.setdefault(source, set()).update(targets - {source})
+    return result
 
 
 # Every attributed declaration is semantically live for stripping. Lean
@@ -1452,9 +1475,12 @@ def plan_source_retention(
     environment_command_files = (
         attribute_command_files | opaque_environment_files
     )
-    attribute_command_roots = detect_attribute_command_roots(decls, originals)
-    opaque_environment_roots = detect_opaque_environment_command_roots(
-        decls, originals, mod_path
+    attribute_command_roots = scoped_source_roots(
+        decls, originals, mod_path, detect_attribute_command_roots
+    )
+    opaque_environment_roots = scoped_source_roots(
+        decls, originals, mod_path,
+        lambda candidates, sources: detect_opaque_environment_command_roots(candidates, sources, mod_path),
     )
     structural_range_files = detect_structural_range_files(
         decls, originals, mod_path
@@ -1506,10 +1532,10 @@ def plan_source_retention(
         "retain_exact_files": retain_exact_files,
         "retain_exact_modules": retained_modules,
         "retain_exact_declarations": {
-            decl["name"]
+            decl_id(decl)
             for decl in decls
             if decl["module"] in retained_modules
-        } | referenced,
+        } | DeclarationIndex(decls).select(referenced),
         "preserve_command_files": environment_command_files,
         "environment_command_roots": (
             attribute_command_roots | opaque_environment_roots
@@ -1569,34 +1595,63 @@ def collect_implicit_dependency_roots(
     decls: list[DeclRange],
     originals: dict[str, str],
     mod_path: dict[str, str],
-) -> dict[str, set[str]]:
-    """Return environment-mediated roots for the keep-set.
+) -> dict[str, set[DeclId]]:
+    """Return physical roots for attributes, syntax and environment commands."""
+    from .notation_roots import detect_notation_body_roots
 
-    These declarations may affect elaboration without appearing as ordinary
-    name references in a theorem's kernel term.
-    """
-
-    from lean_strip._pipeline.preprocessing import notation_roots as _notation_roots
-
+    index = DeclarationIndex(decls)
+    attributed: set[DeclId] = set()
+    implicit: set[DeclId] = set()
+    by_module: dict[str, list[DeclRange]] = {}
+    for decl in decls:
+        by_module.setdefault(decl["module"], []).append(decl)
+    for module, path in mod_path.items():
+        local = by_module.get(module, [])
+        sources = {path: originals[path]} if path in originals else {}
+        local_index = DeclarationIndex(local)
+        # Declaration annotations belong to this module's copy only.
+        attributed |= local_index.select(detect_automation_tagged(local, sources, mod_path))
+        implicit |= local_index.select(detect_force_keep_kinds(local, sources, mod_path))
+    attributed |= scoped_source_roots(decls, originals, mod_path, detect_attribute_command_roots)
+    implicit |= scoped_source_roots(decls, originals, mod_path, detect_open_hiding_roots)
+    for detector in (detect_open_renaming_roots, detect_run_command_roots, detect_notation_body_roots):
+        implicit |= scoped_source_roots(decls, originals, mod_path, detector)
     return {
-        "attributed": detect_automation_tagged(decls, originals, mod_path),
-        "implicit_kinds": detect_force_keep_kinds(decls, originals, mod_path)
-        | detect_open_hiding_roots(decls, originals)
-        | detect_open_renaming_roots(decls, originals)
-        | detect_run_command_roots(decls, originals)
-        | _notation_roots.detect_notation_body_roots(decls, originals),
-        "open_namespace_candidates": detect_open_namespace_roots(
-            decls, originals
-        ),
+        "attributed": attributed,
+        "implicit_kinds": implicit,
+        "open_namespace_candidates": index.select(detect_open_namespace_roots(decls, originals)),
     }
+
+
+def scoped_source_roots(
+    decls: list[DeclRange],
+    originals: dict[str, str],
+    mod_path: dict[str, str],
+    detector: Callable[[list[DeclRange], dict[str, str]], set[str]],
+) -> set[DeclId]:
+    """Resolve command roots only among providers visible in that source file."""
+    index = DeclarationIndex(decls)
+    if all(len(providers) == 1 for providers in index.by_name.values()):
+        return index.select(detector(decls, originals))
+    graph, _paths = build_module_import_graph(
+        originals, derive_source_root(mod_path) or "/testbed/", known_module_paths=mod_path
+    )
+    roots: set[DeclId] = set()
+    for module, path in mod_path.items():
+        if path not in originals:
+            continue
+        visible = _closure(graph, {module})
+        candidates = [decl for decl in decls if decl["module"] in visible]
+        roots |= DeclarationIndex(candidates).select(detector(candidates, {path: originals[path]}))
+    return roots
 
 
 def compute_keep_set(
     decls: list[DeclRange],
-    deps: dict[str, set[str]],
-    seed: set[str],
-    implicit_roots: set[str] | None = None,
-) -> set[str]:
+    deps: Dependencies,
+    seed: set[DeclId],
+    implicit_roots: set[DeclId] | None = None,
+) -> set[DeclId]:
     """Transitive forward-dependency closure = the set of decls to keep.
 
     Starts from `seed` (the protected declarations), plus every
@@ -1610,22 +1665,24 @@ def compute_keep_set(
     Semantic acceptance, including axiom policy, belongs exclusively to the
     official comparator and never changes this reachability closure.
     """
-    name_set = {d["name"] for d in decls}
-    keep: set[str] = set()
-    work: list[str] = []
+    index = DeclarationIndex(decls)
+    name_set = index.identities
+    deps = index.dependencies(deps)
+    keep: set[DeclId] = set()
+    work: list[DeclId] = []
 
-    def _add(n: str) -> None:
+    def _add(n: DeclId) -> None:
         if n in name_set and n not in keep:
             keep.add(n)
             work.append(n)
 
-    for s in seed:
+    for s in index.select(seed):
         _add(s)
-    for n in implicit_roots or set():
+    for n in index.select(implicit_roots or set()):
         _add(n)
     for d in decls:
         if d["meta"]:
-            _add(d["name"])
+            _add(decl_id(d))
 
     while work:
         n = work.pop()
@@ -1634,9 +1691,10 @@ def compute_keep_set(
     return keep
 
 
-def attach_keep(decls: list[DeclRange], keep: set[str]) -> list[DeclRange]:
+def attach_keep(decls: list[DeclRange], keep: set[DeclId]) -> list[DeclRange]:
     """Return decls with a `keep` bool set from membership in `keep`."""
-    return [{**d, "keep": d["name"] in keep} for d in decls]
+    selected = DeclarationIndex(decls).select(keep)
+    return [{**d, "keep": decl_id(d) in selected} for d in decls]
 
 
 def module_to_relpath(module: str) -> str:
@@ -3070,6 +3128,7 @@ def plan_stripped_sources(
         names for module, names in kept_by_module.items()
         if module not in resolved_paths
     ))
+    has_duplicate_names = len({str(row["name"]) for row in rows}) < len({decl_id(row) for row in rows})
     lean_context = syntax_edit.Context(
         project_declarations=project_declarations,
         deleted=project_declarations - kept_declarations,
@@ -3091,8 +3150,17 @@ def plan_stripped_sources(
             if module is not None else kept_declarations
         )
         if path in lean_files and path not in stub_paths:
+            context = lean_context
+            if has_duplicate_names:
+                context = syntax_edit.Context(
+                    project_declarations=project_declarations,
+                    deleted=project_declarations - visible_kept,
+                    kept=visible_kept,
+                    imported_namespaces=imported,
+                    custom_commands=frozenset(custom_commands),
+                )
             planned = syntax_edit.plan_file(
-                syntax[path], lean_rows.get(path, []), lean_context, visible_kept=visible_kept,
+                syntax[path], lean_rows.get(path, []), context, visible_kept=visible_kept,
             )
             if planned is not None:
                 cleaned, cleanup = planned
@@ -3111,7 +3179,7 @@ def plan_stripped_sources(
         cleaned, cleanup = remove_dead_commands(
             content,
             project_declarations,
-            kept_declarations,
+            visible_kept,
             imported,
             visible_kept_declarations=visible_kept,
             custom_commands=custom_commands,
@@ -3198,10 +3266,10 @@ def derive_source_roots(mod_path: dict[str, str]) -> list[str]:
 def namespace_anchor_roots(
     originals: dict[str, str],
     decls: list[DeclRange],
-    keep: set[str],
+    keep: set[DeclId],
     module_paths: dict[str, str],
     imported_namespaces: set[str] | None = None,
-) -> set[str]:
+) -> set[DeclId]:
     """Declarations to keep so that every surviving `open X` still finds `X`.
 
     Lean rejects `open X` unless namespace `X` exists at that point; a file's
@@ -3213,20 +3281,21 @@ def namespace_anchor_roots(
     imports provide survive, keep one of those.
     """
 
+    keep = DeclarationIndex(decls).select(keep)
     imported = set(imported_namespaces or ())
     import_graph, resolved = build_module_import_graph(
         originals, "/testbed/", known_module_paths=module_paths
     )
     path_modules = {path: module for module, path in resolved.items()}
-    module_of: dict[str, str] = {}
-    by_namespace: dict[str, list[str]] = {}
+    module_of: dict[DeclId, str] = {}
+    by_namespace: dict[str, list[DeclId]] = {}
     for decl in decls:
         name = str(decl["name"])
-        module_of[name] = str(decl["module"])
+        module_of[decl_id(decl)] = str(decl["module"])
         parts = name.split(".")
         for end in range(1, len(parts)):
-            by_namespace.setdefault(".".join(parts[:end]), []).append(name)
-    anchors: set[str] = set()
+            by_namespace.setdefault(".".join(parts[:end]), []).append(decl_id(decl))
+    anchors: set[DeclId] = set()
     for path, text in originals.items():
         module = path_modules.get(path)
         if module is None or "open" not in text:
@@ -3340,9 +3409,9 @@ def module_keep_set(
 
 def declaration_dependency_closure(
     decls: list[DeclRange],
-    deps: dict[str, set[str]],
-    roots: set[str],
-) -> set[str]:
+    deps: Dependencies,
+    roots: set[DeclId],
+) -> set[DeclId]:
     """Return the project-declaration closure of ``roots`` only.
 
     This intentionally differs from :func:`compute_keep_set`: no roots are
@@ -3353,8 +3422,11 @@ def declaration_dependency_closure(
     declaration was pruned and certifies the result with the final builds.
     """
 
-    names = {decl["name"] for decl in decls}
-    seen: set[str] = set()
+    index = DeclarationIndex(decls)
+    names = index.identities
+    roots = index.select(roots)
+    deps = index.dependencies(deps)
+    seen: set[DeclId] = set()
     stack = [name for name in roots if name in names]
     while stack:
         name = stack.pop()
@@ -3456,8 +3528,8 @@ def remap_decl_ranges_after_source_rewrite(
 def plan_protected_module_prune(
     originals: dict[str, str],
     decls: list[DeclRange],
-    deps: dict[str, set[str]],
-    protected_names: set[str],
+    deps: Dependencies,
+    protected_names: set[DeclId],
     entry_module: str,
     *,
     extra_keep_modules: set[str] | None = None,
@@ -3502,10 +3574,10 @@ def plan_protected_module_prune(
         raise ValueError(f"entry module {entry_module!r} absent from source graph")
 
     # A name two modules declare has a row per copy (olean.py); both stay live.
-    owners_by_name: dict[str, set[str]] = {}
-    for decl in decls:
-        owners_by_name.setdefault(decl["name"], set()).add(decl["module"])
-    missing = sorted(protected_names - set(owners_by_name))
+    index = DeclarationIndex(decls)
+    missing = sorted(str(value) for value in protected_names if not index.resolve(value))
+    protected_names = index.select(protected_names)
+    owners_by_name = {decl_id(decl): {decl["module"]} for decl in decls}
     if missing:
         raise ValueError(f"protected declarations have no source owner: {missing}")
 
@@ -3579,9 +3651,11 @@ def plan_protected_module_prune(
         "entry_module": entry_module,
         "protected_modules": sorted(protected_modules),
         "explicit_keep_modules": sorted(explicit_keep_modules),
-        "protected_declarations": sorted(protected_names),
+        "protected_declarations": sorted({name for _module, name in protected_names}),
+        "protected_declaration_identities": identity_rows(protected_names),
         "live_declaration_count": len(live_declarations),
-        "live_declarations": sorted(live_declarations),
+        "live_declarations": sorted({name for _module, name in live_declarations}),
+        "live_declaration_identities": identity_rows(live_declarations),
         "live_modules": sorted(live_modules),
         "kept_modules": sorted(keep_modules),
         "deleted_modules": sorted(deleted_modules),

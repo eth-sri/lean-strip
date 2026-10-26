@@ -9,6 +9,7 @@ from typing import Any
 from lean_strip._pipeline.metrics.source_archive import count_lean_words_in_source
 from lean_strip._pipeline.metrics.tokens import count_lean_tokens_in_source, remove_lean_comments
 
+from ._pipeline.preprocessing.identity import DeclId, DeclarationIndex, decl_id, identity_rows
 from .engine import StripResult, iter_lean_files
 
 METRICS = ("lines", "code_lines", "tokens", "words")
@@ -70,8 +71,8 @@ def _span(row: dict[str, Any]) -> tuple[tuple[int, int], tuple[int, int]] | None
 
 
 def _generated_helpers(
-    dropped: list[str], kept: set[str], by_name: dict[str, dict[str, Any]]
-) -> set[str]:
+    dropped: list[DeclId], kept: set[DeclId], by_identity: dict[DeclId, dict[str, Any]]
+) -> set[DeclId]:
     """Dropped names whose source range lies inside a kept declaration.
 
     These are compiler-generated companions (``.elim``, ``noConfusion``, ...)
@@ -80,13 +81,13 @@ def _generated_helpers(
 
     kept_spans: dict[str, list[tuple[tuple[int, int], tuple[int, int]]]] = {}
     for name in kept:
-        row = by_name.get(name)
+        row = by_identity.get(name)
         span = _span(row) if row else None
         if span:
             kept_spans.setdefault(str(row["module"]), []).append(span)
     helpers = set()
     for name in dropped:
-        row = by_name.get(name)
+        row = by_identity.get(name)
         span = _span(row) if row else None
         if span and any(
             start <= span[0] and span[1] <= end
@@ -117,16 +118,26 @@ def summarize(
     }
     isolated_totals["files"] = sum(1 for path in before["files"] if path in isolated_set)
 
-    by_name = {str(row["name"]): row for row in result.decls}
+    by_identity = {decl_id(row): row for row in result.decls}
+    index = DeclarationIndex(result.decls)
     path_of = {module: path.removeprefix("/testbed/") for module, path in result.module_paths.items()}
-    all_dropped = [str(name) for name in report.get("dropped_decls", [])]
-    helpers = _generated_helpers(all_dropped, set(report.get("kept_declarations", [])), by_name)
+    all_dropped = sorted(index.select(report.get(
+        "dropped_declaration_identities", report.get("dropped_decls", [])
+    )))
+    kept = index.select(report.get("kept_declaration_identities", report.get("kept_declarations", [])))
+    helpers = _generated_helpers(all_dropped, kept, by_identity)
     dropped = [name for name in all_dropped if name not in helpers]
-    module_pruned = set(report.get("module_pruned_declarations", []))
-    kinds = Counter(str(by_name.get(name, {}).get("kind", "?")) for name in dropped)
+    module_pruned = index.select(report.get(
+        "module_pruned_declaration_identities", report.get("module_pruned_declarations", [])
+    ))
+    kinds = Counter(str(by_identity.get(name, {}).get("kind", "?")) for name in dropped)
     per_file: Counter[str] = Counter(
-        path_of.get(str(by_name.get(name, {}).get("module")), "?") for name in dropped
+        path_of.get(str(by_identity.get(name, {}).get("module")), "?") for name in dropped
     )
+    def display(identity: DeclId) -> str:
+        module, name = identity
+        return f"{module}:{name}" if len(index.by_name[name]) > 1 else name
+
     grind = report.get("grind_normalization", {})
     grind_files = grind.get("files", [])
 
@@ -152,10 +163,12 @@ def summarize(
             "dropped": len(dropped),
             "dropped_with_deleted_modules": len(module_pruned),
             "protected": report.get("protected_declarations", []),
+            "protected_identities": report.get("protected_declaration_identities", []),
             "dropped_by_kind": dict(kinds.most_common()),
             "dropped_by_file": dict(per_file.most_common()),
-            "dropped_names": dropped,
-            "dropped_generated_helpers": sorted(helpers),
+            "dropped_names": [display(identity) for identity in dropped],
+            "dropped_identities": identity_rows(dropped),
+            "dropped_generated_helpers": [display(identity) for identity in sorted(helpers)],
         },
         "grind": {
             "discovery_calls": sum(int(row.get("initial_calls", 0)) for row in grind_files),

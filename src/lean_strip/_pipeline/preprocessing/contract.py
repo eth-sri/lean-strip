@@ -10,18 +10,19 @@ from __future__ import annotations
 from typing import Any
 
 from lean_strip._pipeline.preprocessing.grind_discovery import DISCOVERY_FLAGS
+from lean_strip._pipeline.preprocessing.graph_artifact import GRAPH_SCHEMA
 
 
-PREPROCESSING_VERSION = "preprocessing_v25"
+PREPROCESSING_VERSION = "preprocessing_v26"
 PREPROCESSING_ALGORITHM = (
-    "verify_raw_query_replay_typed_graph_generated_aux_owner_edges_"
+    "verify_raw_query_replay_module_name_identity_graph_generated_aux_owner_edges_"
     "exact_environment_roots_strip_"
     "exact_kernel_edges_root_scoped_attributes_prune_selective_opens_with_"
     "source_order_safe_imported_namespace_provenance_"
     "drop_observational_commands_and_anonymous_examples_restore_grind_warm_build_"
     "persist_comparator_exact_discard_empty"
 )
-PIPELINE_SCHEMA = "leancompression_preprocessing_contract_v25"
+PIPELINE_SCHEMA = "leancompression_preprocessing_contract_v26"
 
 FINAL_GRIND_SOURCE_ORIGINAL = "restore_original_after_dependency_discovery"
 FAILED_GRIND_FILE_POLICY = "retain_exact_raw_file"
@@ -55,7 +56,7 @@ def report_contract() -> dict[str, Any]:
         "failed_grind_file_policy": FAILED_GRIND_FILE_POLICY,
         "semantic_acceptance_oracle": "official_palomar_comparator",
         "internal_signature_fingerprinting": False,
-        "dependency_graph_artifact": "preprocessing_dependency_graph_v2",
+        "dependency_graph_artifact": GRAPH_SCHEMA,
         "zero_project_declaration_policy": "discard_from_dataset",
         "module_then_declaration_liveness": True,
         "dead_source_command_policy": (

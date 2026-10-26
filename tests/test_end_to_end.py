@@ -110,8 +110,8 @@ def test_dump_follows_auxiliary_constants(tmp_path):
     (root / "mods.txt").write_text("AuxT.Basic\n")
     out = subprocess.run(["lake", "env", "lean", "--run", "dump.lean", "--modules-file", "mods.txt"],
                          cwd=root, check=True, capture_output=True, text=True).stdout
-    edges = {tuple(line.split("\t")[1:3]) for line in out.splitlines() if line.startswith("DEP\t")}
-    assert ("tg", "f_eq") in edges and ("tg", "f") in edges
+    edges = {tuple(line.split("\t")[1:]) for line in out.splitlines() if line.startswith("DEP\t")}
+    assert ("AuxT.Basic", "tg", "AuxT.Basic", "f_eq") in edges and ("AuxT.Basic", "tg", "AuxT.Basic", "f") in edges
 
 
 def test_edits_come_from_lean_and_build_without_repairs(tmp_path, monkeypatch):
@@ -201,3 +201,63 @@ def test_definition_configs_keep_realization_sites(tmp_path, definitions):
     else:
         # A theorem-only config keeps the strip it had.
         assert "theorem site " not in text and "comparator_closure" not in report
+
+
+def test_duplicate_theorems_keep_separate_kernel_and_source_dependencies(tmp_path):
+    from lean_strip._pipeline.preprocessing.dependency_graph import collect_dependency_graph
+    from lean_strip._pipeline.preprocessing.identity import decl_id
+    from lean_strip.workspace import LocalWorkspace
+
+    (tmp_path / "lean-toolchain").write_text(TOOLCHAIN)
+    (tmp_path / "lakefile.toml").write_text(
+        'name = "duplicates"\n[[lean_lib]]\nname = "A"\n[[lean_lib]]\nname = "B"\n'
+    )
+    originals = {
+        f"/testbed/{module}.lean": (
+            f"axiom only{module} : True\n"
+            f"theorem shared : True := only{module}\n"
+        )
+        for module in ("A", "B")
+    }
+    for path, source in originals.items():
+        (tmp_path / Path(path).name).write_text(source)
+    subprocess.run(["lake", "build", "A", "B"], cwd=tmp_path, check=True, capture_output=True)
+    workspace = LocalWorkspace(tmp_path, tmp_path.parent / (tmp_path.name + "-scratch"),
+                               default_timeout=120, lean_threads=2)
+    graph = collect_dependency_graph(workspace, originals, modules=["A", "B"])
+    assert {decl_id(row) for row in graph.declarations} == {
+        (module, name) for module in ("A", "B") for name in ("shared", f"only{module}")
+    }
+    for layer in ("kernel", "ilean", "source_text"):
+        assert graph.edge_layers[layer] == {
+            ((module, "shared"), (module, f"only{module}")) for module in ("A", "B")
+        }
+
+    # Exercise the engine's name-only comparator input as well: the entry
+    # environment selects A's physical provider for protection. The graph
+    # retains B's copy and its edges even when module pruning removes B.
+    from lean_strip import engine
+    from lean_strip._pipeline.preprocessing.identity import identity_rows
+
+    diagnostics = tmp_path / "diagnostics"
+    console = cli._Console(tmp_path / "pipeline.log", quiet=True)
+    try:
+        graph_only = engine.run_strip(workspace, engine.StripSettings(
+            entry_module="A", build_target="A", protected={"shared"},
+            diagnostics_dir=diagnostics, graph_only=True,
+        ), console.stage)
+        assert graph_only.report["protected_declaration_identities"] == identity_rows({("A", "shared")})
+        graph_export = json.loads((diagnostics / "dependency-graph.json").read_text())
+        assert graph_export["policies"]["production"]["removed"] == []
+        result = engine.run_strip(workspace, engine.StripSettings(
+            entry_module="A", build_target="A", protected={"shared"},
+            diagnostics_dir=diagnostics,
+        ), console.stage)
+    finally:
+        console.log_file.close()
+    assert result.report["protected_declaration_identities"] == identity_rows({("A", "shared")})
+    assert result.report["kept_declaration_identities"] == identity_rows({("A", "onlyA"), ("A", "shared")})
+    exported = json.loads((diagnostics / "dependency-graph.json").read_text())
+    state = exported["policies"]["production"]
+    assert [decl_id(exported["nodes"][i]) for i in state["removed"]] == [("B", "onlyB"), ("B", "shared")]
+    assert [decl_id(exported["nodes"][i]) for i in state["protected"]] == [("A", "shared")]

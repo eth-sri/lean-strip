@@ -12,10 +12,12 @@ from lean_strip._pipeline.preprocessing import ilean as lean_ilean, strip as lea
 from lean_strip._pipeline.preprocessing.examples import discover_modules
 from lean_strip._pipeline.preprocessing.olean import read_olean_declarations
 
-METHOD = "preprocessing_olean_ilean_source_v1"
+from .identity import Dependencies, Edge
+
+METHOD = "preprocessing_olean_ilean_source_v2"
 
 
-def dependency_edges(deps: dict[str, set[str]]) -> set[tuple[str, str]]:
+def dependency_edges(deps: Dependencies) -> set[Edge]:
     return {
         (source, target)
         for source, targets in deps.items()
@@ -26,12 +28,12 @@ def dependency_edges(deps: dict[str, set[str]]) -> set[tuple[str, str]]:
 def combine_dependency_evidence(
     ilean_reader: Any,
     decls: list[dict],
-    deps: dict[str, set[str]],
+    deps: Dependencies,
     originals: dict[str, str],
     mod_path: dict[str, str],
     *,
     modules: set[str] | None = None,
-) -> tuple[dict[str, set[str]], dict, dict[str, set[tuple[str, str]]]]:
+) -> tuple[Dependencies, dict, dict[str, set[Edge]]]:
     """Union every static dependency evidence layer into one graph.
 
     The kernel graph is authoritative for dependencies retained in elaborated
@@ -59,26 +61,30 @@ def combine_dependency_evidence(
             f"missing_modules={missing_modules}"
         )
     ilean_edges = dependency_edges(ilean_deps)
+    source_ambiguities: list[dict] = []
     source_edges = dependency_edges(
-        lean_strip.augment_deps_with_source(decls, {}, originals, mod_path)
+        lean_strip.augment_deps_with_source(
+            decls, {}, originals, mod_path, ambiguities=source_ambiguities
+        )
     )
     # Restore the report's kernel-relative meaning, which the empty base above
     # would otherwise leave measured against nothing.
     ilean_report["already_present_edges"] = len(ilean_edges & kernel_edges)
     ilean_report["added_edges"] = len(ilean_edges - kernel_edges)
 
-    augmented: dict[str, set[str]] = {}
+    augmented: Dependencies = {}
     for source, target in kernel_edges | ilean_edges | source_edges:
         augmented.setdefault(source, set()).add(target)
     union_edges = dependency_edges(augmented)
     report = {
-        "schema": "static_dependency_evidence_v2",
+        "schema": "static_dependency_evidence_v3",
         "composition": "set_union",
         "attribution": "multi_label_per_edge",
         "kernel_edges": len(kernel_edges),
         "ilean": ilean_report,
         "ilean_edges": len(ilean_edges),
         "source_text_edges": len(source_edges),
+        "source_text_ambiguous_targets": source_ambiguities,
         "ilean_edges_added": len(ilean_edges - kernel_edges),
         "source_text_edges_added": len(
             source_edges - kernel_edges - ilean_edges
@@ -96,12 +102,12 @@ def combine_dependency_evidence(
 @dataclass
 class DependencyGraph:
     declarations: list[dict]
-    dependencies: dict[str, set[str]]
+    dependencies: Dependencies
     imported_namespaces: set[str]
     originals: Mapping[str, str]
     module_paths: dict[str, str]
     evidence: dict
-    edge_layers: dict[str, set[tuple[str, str]]]
+    edge_layers: dict[str, set[Edge]]
     source_dirs: list[str] | None = None
 
 
