@@ -261,3 +261,32 @@ def test_duplicate_theorems_keep_separate_kernel_and_source_dependencies(tmp_pat
     state = exported["policies"]["production"]
     assert [decl_id(exported["nodes"][i]) for i in state["removed"]] == [("B", "onlyB"), ("B", "shared")]
     assert [decl_id(exported["nodes"][i]) for i in state["protected"]] == [("A", "shared")]
+
+
+
+def test_isolated_olean_roots_preserve_imported_and_duplicate_dependencies(tmp_path):
+    from lean_strip._pipeline.preprocessing import olean
+    from lean_strip.workspace import LocalWorkspace
+
+    (tmp_path / "lean-toolchain").write_text(TOOLCHAIN)
+    (tmp_path / "lakefile.toml").write_text(
+        'name = "isolated"\n[[lean_lib]]\nname = "A"\n[[lean_lib]]\nname = "B"\n'
+        '[[lean_lib]]\nname = "Base"\n'
+    )
+    for name, source in {
+        "Base": "axiom onlyBase : True\n",
+        "A": "import Base\ntheorem shared : True := onlyBase\n",
+        "B": "axiom onlyB : True\ntheorem shared : True := onlyB\n",
+    }.items():
+        (tmp_path / f"{name}.lean").write_text(source)
+    subprocess.run(["lake", "build", "A", "B"], cwd=tmp_path, check=True, capture_output=True)
+    ws = LocalWorkspace(tmp_path, tmp_path.parent / (tmp_path.name + "-scratch"),
+                        default_timeout=120, lean_threads=2)
+    decls, dependencies, _namespaces = olean.read_olean_declarations(ws, ["A", "B", "Base"], timeout=120)
+    assert {(row["module"], row["name"]) for row in decls} == {
+        ("A", "shared"), ("B", "shared"), ("B", "onlyB"), ("Base", "onlyBase"),
+    }
+    assert dependencies == {
+        ("A", "shared"): {("Base", "onlyBase")},
+        ("B", "shared"): {("B", "onlyB")},
+    }

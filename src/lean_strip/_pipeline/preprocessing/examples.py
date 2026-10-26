@@ -10,13 +10,15 @@ from lean_strip._pipeline.preprocessing.olean import DeclRange
 
 
 _DISCOVER_MODULES_CMD = (
+    "set -eu; set -o pipefail; "
     r"sources=$(find /testbed -path '*/.lake' -prune -o -type f -name '*.lean' -print); "
     r"find /testbed/.lake/build/lib -name '*.olean' "
     r"| while IFS= read -r file; do "
     r"rel=${file#/testbed/.lake/build/lib/}; rel=${rel#lean/}; "
     r"rel=${rel%.olean}; "
     "if test -f \"/testbed/${rel}.lean\" "
-    "|| printf '%s\\n' \"$sources\" | grep -Fq \"/${rel}.lean\"; then "
+    # Drain the entire source list: early exit causes printf SIGPIPE diagnostics.
+    "|| printf '%s\\n' \"$sources\" | grep -F -- \"/${rel}.lean\" > /dev/null; then "
     "printf './%s\\n' \"$rel\"; fi; "
     r"done | sort"
 )
@@ -42,14 +44,22 @@ def _module_name_from_olean_relpath(relative_path: str) -> str:
 def discover_modules(env: Any) -> list[str]:
     """Return modules that have both a built ``.olean`` and a project source."""
     result = env.execute(_DISCOVER_MODULES_CMD)
-    modules = [
-        _module_name_from_olean_relpath(row.strip().removeprefix("./"))
-        if row.strip().startswith("./")
-        else row.strip()
-        for row in result.get("output", "").strip().splitlines()
-        if row.strip()
-    ]
-    return modules
+    output = result.get("output", "")
+    if result.get("returncode", 1) != 0 or result.get("timed_out"):
+        raise RuntimeError(f"Project module discovery failed: {output[-2000:]}")
+    modules: list[str] = []
+    for row in output.splitlines():
+        if not row.strip():
+            continue
+        # Only the shell's ./relative/path records are names. stderr is merged
+        # into stdout by workspaces, so diagnostics must fail discovery.
+        relative = row.removeprefix("./")
+        if (not row.startswith("./")
+                or any(part in ("", ".", "..") for part in relative.split("/"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in row)):
+            raise RuntimeError(f"Unexpected module discovery output: {row[:1000]!r}")
+        modules.append(_module_name_from_olean_relpath(relative))
+    return list(dict.fromkeys(modules))
 
 
 _DUMP_ANONYMOUS_EXAMPLES_LEAN = r"""

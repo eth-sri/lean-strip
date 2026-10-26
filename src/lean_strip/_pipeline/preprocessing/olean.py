@@ -6,6 +6,7 @@ an independently published dependency graph. Use dependency_graph for graphs.
 from __future__ import annotations
 
 import shlex
+import time
 from typing import Any
 
 from .identity import Dependencies
@@ -277,39 +278,48 @@ unsafe def main (args : List String) : IO Unit := do
       let roots := rootsContent.splitOn "\n" |>.filter (fun s => !s.isEmpty)
       pure (modules, roots)
     | _ => pure (args, args)
-  -- Separate environments preserve homonyms in independently built modules.
-  for root in importArgs do
-    dumpModule moduleArgs [root]
+  -- A process owns exactly one root: imported .olean regions are retained
+  -- for the process lifetime even after the Environment is no longer used.
+  match importArgs with
+  | [root] => dumpModule moduleArgs [root]
+  | _ => throw <| IO.userError "expected exactly one root module"
 """.strip()
 
 # Logical scratch paths (mapped to the local workspace) for the script and its
 # module list.
 _DUMP_KEEP_PATH = "/tmp/_dump_keep.lean"
 _DUMP_KEEP_MODULES_PATH = "/tmp/_dump_keep_modules.txt"
+_DUMP_KEEP_ROOT_PATH = "/tmp/_dump_keep_root.txt"
 
 # One declaration: name, module, source range, kind, meta flag. Other layers
 # add a `keep` bool; anonymous-example rows use the same shape.
 DeclRange = dict[str, Any]
 
 
-def _install_dump_keep_script(env: Any) -> None:
+def _install_dump_keep_script(env: Any, *, timeout: float) -> None:
     """Write the keep-graph Lean script into the workspace scratch directory."""
     cmd = f"cat > {_DUMP_KEEP_PATH} << 'LEANDUMPKEEP_EOF'\n{_DUMP_KEEP_LEAN}\nLEANDUMPKEEP_EOF"
-    env.execute(cmd)
+    result = env.execute(cmd, timeout=timeout)
+    if result.get("returncode", 1) != 0 or result.get("timed_out"):
+        raise DeclGraphExtractionError(
+            returncode=result.get("returncode"), timed_out=result.get("timed_out"),
+            diagnostics=result.get("output", "")[-4000:], declarations=0,
+        )
 
 
 class DeclGraphExtractionError(RuntimeError):
     """Keep the subprocess failure distinct from a genuinely empty graph."""
 
-    def __init__(self, *, returncode, timed_out, diagnostics, declarations):
+    def __init__(self, *, returncode, timed_out, diagnostics, declarations, root_module=None):
         self.details = {
             "returncode": returncode, "timed_out": bool(timed_out),
             "diagnostics": diagnostics, "partial_declarations": declarations,
+            "root_module": root_module,
             "failure_kind": "timeout" if timed_out else "killed" if returncode in (137, -9) else "process_error",
         }
         super().__init__(
             f"Lean graph extraction {self.details['failure_kind']} "
-            f"(rc={returncode}, partial declarations={declarations}): {diagnostics[-2000:]}"
+            f"(root={root_module!r}, rc={returncode}, partial declarations={declarations}): {diagnostics[-2000:]}"
         )
 
 
@@ -325,16 +335,33 @@ def read_olean_declarations(
     the keep-set in Python (strip.compute_keep_set).
 
     `modules` is the non-empty list of project modules to import and scan.
-    Output is streamed so the full dump never has to be held as one string.
+    Each root runs in a fresh Lean process with the complete project-module
+    list, releasing its imported .olean regions on exit. Output is streamed;
+    all roots and script setup share one timeout. No graph is returned unless
+    every root succeeds within that budget.
 
     Requires `lake build` to have succeeded so .olean files exist.
     Raises DeclGraphExtractionError if the query fails.
     """
-    _install_dump_keep_script(env)
+    modules = list(dict.fromkeys(modules))
+    if not modules:
+        return [], {}, set()
+    deadline = time.monotonic() + timeout
     decls: list[DeclRange] = []
     deps: Dependencies = {}
     imported_namespaces: set[str] = set()
     diagnostics: list[str] = []
+
+    def remaining(root_module: str | None = None) -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise DeclGraphExtractionError(
+                returncode=None, timed_out=True, diagnostics="overall extraction timeout exhausted",
+                declarations=len(decls), root_module=root_module,
+            )
+        return seconds
+
+    _install_dump_keep_script(env, timeout=remaining())
 
     def consume_line(line: str) -> None:
         line = line.rstrip("\r\n")
@@ -363,20 +390,26 @@ def read_olean_declarations(
     env.write_file_bytes(_DUMP_KEEP_MODULES_PATH, payload)
     lean_command = (
         f"lean --run {_DUMP_KEEP_PATH} "
-        f"--modules-file {_DUMP_KEEP_MODULES_PATH}"
+        f"--modules-file {_DUMP_KEEP_MODULES_PATH} "
+        f"--roots-file {_DUMP_KEEP_ROOT_PATH}"
     )
+    # One invocation per root releases Lean's imports on exit. The workspace
+    # cancels the entire Lake/Lean process group if the shared budget expires.
     cmd = "cd /testbed && lake env sh -c " + shlex.quote("exec " + lean_command)
-    result = env.execute_stream(
-        cmd,
-        timeout=timeout,
-        on_output=consume_line,
-        capture_output=False,
-    )
-
-    if result.get("returncode", 1) != 0 or result.get("timed_out"):
-        detail = "\n".join(diagnostics)[-4000:] or result.get("output", "")[-4000:]
-        raise DeclGraphExtractionError(
-            returncode=result.get("returncode"), timed_out=result.get("timed_out"),
-            diagnostics=detail, declarations=len(decls),
+    for root_module in modules:
+        diagnostics.clear()
+        env.write_file_bytes(_DUMP_KEEP_ROOT_PATH, (root_module + "\n").encode("utf-8"))
+        result = env.execute_stream(
+            cmd,
+            timeout=remaining(root_module),
+            on_output=consume_line,
+            capture_output=False,
         )
+        if result.get("returncode", 1) != 0 or result.get("timed_out"):
+            detail = "\n".join(diagnostics)[-4000:] or result.get("output", "")[-4000:]
+            raise DeclGraphExtractionError(
+                returncode=result.get("returncode"), timed_out=result.get("timed_out"),
+                diagnostics=detail, declarations=len(decls), root_module=root_module,
+            )
+        remaining(root_module)
     return decls, deps, imported_namespaces

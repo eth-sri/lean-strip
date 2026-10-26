@@ -90,9 +90,10 @@ The diagnostic `dependency-graph.json` uses schema `preprocessing_dependency_gra
 Declarations are identified by `(module, full Lean name)` throughout extraction,
 reachability and reporting, so independently built modules can provide separate
 copies of the same name with different dependencies and statuses. Kernel extraction
-queries each module in its own environment; `.ilean` references retain their defining
-module. Edges use indexes into the physical `nodes` array. `ambiguous_edges` records
-source and target candidate indexes plus the evidence bitmask when a reference has
+queries each module in a fresh process, releasing imported `.olean` regions between
+roots. All roots share one timeout, and any failed root aborts the graph. `.ilean`
+references retain their defining module. Edges use indexes into the physical `nodes`
+array. `ambiguous_edges` records source and target candidate indexes plus the evidence bitmask when a reference has
 multiple possible providers. Static discovery conservatively retains candidate targets;
 legacy name-only export edges are recorded as ambiguous instead of selecting a provider.
 Policy reports include authoritative `{module, name}` identity records alongside the

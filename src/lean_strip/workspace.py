@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -123,6 +124,7 @@ class LocalWorkspace:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
         lines: list[str] = []
 
@@ -137,13 +139,30 @@ class LocalWorkspace:
 
         thread = threading.Thread(target=reader, daemon=True)
         thread.start()
+
+        def terminate() -> None:
+            # Lake and shells wait for subprocesses. Killing only the launcher
+            # leaves Lean running and its stdout open, blocking reader.join().
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
         timed_out = False
         try:
             process.wait(timeout=self._timeout(timeout))
+            if process.returncode != 0:
+                terminate()
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
-            process.wait()
+            terminate()
+        except BaseException:
+            # A new session does not receive the parent's Ctrl-C; explicitly
+            # stop its children on interruption as well as on timeout.
+            terminate()
+            thread.join()
+            raise
         thread.join()
         output = "".join(lines)
         self._log(

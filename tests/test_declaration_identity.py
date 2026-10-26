@@ -47,14 +47,15 @@ def edge_identities(graph):
 
 def test_olean_wire_format_preserves_both_endpoints():
     class Reader:
-        def execute(self, command):
-            pass
+        def execute(self, command, **kwargs):
+            return {"returncode": 0}
 
         def write_file_bytes(self, path, payload):
-            pass
+            if path == olean._DUMP_KEEP_ROOT_PATH:
+                self.root = payload.decode().strip()
 
         def execute_stream(self, command, *, on_output, **kwargs):
-            for module in ("A", "B"):
+            for module in (self.root,):
                 on_output(f"DECL\tshared\t{module}\t2\t0\t2\t50\ttheorem\tnormal\n")
                 on_output(f"DEP\t{module}\tshared\t{module}\tonly{module}\n")
             return {"returncode": 0}
