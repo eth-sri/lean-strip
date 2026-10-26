@@ -220,7 +220,7 @@ def test_interruption_also_terminates_the_process_group(workspace, monkeypatch):
 
     monkeypatch.setattr(workspace_module.subprocess, "Popen", interrupted_process)
     with pytest.raises(KeyboardInterrupt):
-        workspace.execute_stream([sys.executable, "-c", "import time; time.sleep(30)"])
+        workspace.execute_stream(["sh", "-c", "sleep 30"])
     assert started[0].returncode == -signal.SIGKILL
 
 
