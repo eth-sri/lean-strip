@@ -191,8 +191,8 @@ def transitive_local_sources(entries: Iterable[Path], root: Path) -> set[Path]:
     return closure
 
 
-def _module_to_relative_path(module: str) -> Path:
-    """Convert an exact Lean module name to its source-path suffix."""
+def _module_components(module: str) -> list[str]:
+    """The components of a Lean module name, with `«…»` quotes removed."""
 
     components: list[str] = []
     component: list[str] = []
@@ -210,7 +210,30 @@ def _module_to_relative_path(module: str) -> Path:
     if quoted:
         raise ValueError(f"unterminated quoted module component: {module!r}")
     components.append("".join(component))
-    return Path(*components).with_suffix(".lean")
+    return components
+
+
+_PLAIN_COMPONENT = re.compile(r"[^\W\d][\w'!?]*")
+
+
+def canonical_module_name(module: str) -> str:
+    """A module name as Lean prints it: `«A».B` is `A.B`; `«Adic spaces»` stays quoted.
+
+    Imports may quote any component (PALOMAR-2026-10-28-000009 imports
+    `«ChromaticPolynomial».ConstantOnConnectedComponents`); lakefile library
+    names and roots are written plainly, so names are compared in this form.
+    """
+
+    return ".".join(
+        component if _PLAIN_COMPONENT.fullmatch(component) else f"«{component}»"
+        for component in _module_components(module)
+    )
+
+
+def _module_to_relative_path(module: str) -> Path:
+    """Convert an exact Lean module name to its source-path suffix."""
+
+    return Path(*_module_components(module)).with_suffix(".lean")
 
 
 def local_import_modules(
@@ -231,7 +254,7 @@ def local_import_modules(
         for match in _IMPORT_COMMAND.finditer(_without_lean_comments(source.read_text())):
             module = match.group("module")
             if _resolve_import(module, search) in retained:
-                modules.add(module)
+                modules.add(canonical_module_name(module))
     return tuple(sorted(modules))
 
 

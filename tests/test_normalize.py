@@ -100,3 +100,16 @@ def test_glob_libraries_are_left_alone_by_isolation(tmp_path):
     # A `.one` glob does not cover submodules, so that library is still narrowed.
     report = normalize.synchronize_lakefile_lean_roots(tmp_path, ("Narrow.A.B",))
     assert report["status"] == "rewritten" and "roots := #[`Narrow.A.B]" in (tmp_path / "lakefile.lean").read_text()
+
+
+def test_quoted_module_components_are_compared_in_canonical_form():
+    # PALOMAR-2026-10-28-000009 imports
+    # `«ChromaticPolynomial».ConstantOnConnectedComponents`; the lakefile's
+    # library is `ChromaticPolynomial`, and isolation found no library for it.
+    from lean_strip._pipeline.palomar_normalize import canonical_module_name
+
+    assert canonical_module_name("«ChromaticPolynomial».ConstantOnConnectedComponents") == \
+        "ChromaticPolynomial.ConstantOnConnectedComponents"
+    assert canonical_module_name("Foo.«Adic spaces».Bar") == "Foo.«Adic spaces».Bar"
+    assert canonical_module_name("Mathlib.Data.Nat") == "Mathlib.Data.Nat"
+    assert canonical_module_name("«A.B».C") == "«A.B».C"
