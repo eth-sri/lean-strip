@@ -340,6 +340,64 @@ def _prepare_workspace(repo: Path, work: Path, dependencies: tuple[str, ...] = (
     overrides = repo / ".lake" / "package-overrides.json"
     if overrides.is_file():
         shutil.copyfile(overrides, work / ".lake" / "package-overrides.json")
+    _absolutize_outside_paths(repo, work)
+
+
+_TOML_OUTSIDE_PATH_RE = re.compile(r'(?m)^(?P<key>[ \t]*(?:path|packagesDir)[ \t]*=[ \t]*)"(?P<value>[^"\n]+)"')
+_LEAN_OUTSIDE_PATH_RE = re.compile(r'(?P<key>\bfrom[ \t]+|\bpackagesDir[ \t]*:=[ \t]*)"(?P<value>[^"\n]+)"')
+
+
+def _absolutize_outside_paths(repo: Path, work: Path) -> list[str]:
+    """Point the work copy's relative paths that leave the project at their real targets.
+
+    A project in a subdirectory may require its repository root by path and
+    share its packages (`path = "../.."`, `packagesDir = "../../.lake/packages"`,
+    PALOMAR-2026-10-27-000028). From `.lean-strip/work` those relative paths
+    point elsewhere; in the work copy's lakefile and manifest they become the
+    absolute paths they mean from the project. Paths inside the project and the
+    repository's own files are left alone.
+    """
+
+    repo = repo.resolve()
+
+    def outside(value: str) -> str | None:
+        if Path(value).is_absolute():
+            return None
+        target = (repo / value).resolve()
+        return None if target == repo or target.is_relative_to(repo) else str(target)
+
+    changed: list[str] = []
+    for name, pattern in (("lakefile.toml", _TOML_OUTSIDE_PATH_RE), ("lakefile.lean", _LEAN_OUTSIDE_PATH_RE)):
+        path = work / name
+        if not path.is_file():
+            continue
+        text = path.read_text()
+
+        def replace(match: re.Match[str]) -> str:
+            target = outside(match.group("value"))
+            if target is None:
+                return match.group(0)
+            changed.append(f"{name}: {match.group('value')} -> {target}")
+            return f'{match.group("key")}"{target}"'
+
+        rewritten = pattern.sub(replace, text)
+        if rewritten != text:
+            path.write_text(rewritten)
+    manifest_path = work / "lake-manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        dirty = False
+        if isinstance(manifest.get("packagesDir"), str) and (target := outside(manifest["packagesDir"])):
+            changed.append(f"lake-manifest.json packagesDir: {manifest['packagesDir']} -> {target}")
+            manifest["packagesDir"], dirty = target, True
+        for package in manifest.get("packages", []):
+            if isinstance(package, dict) and package.get("type") == "path" and isinstance(package.get("dir"), str):
+                if (target := outside(package["dir"])):
+                    changed.append(f"lake-manifest.json {package.get('name')}: {package['dir']} -> {target}")
+                    package["dir"], dirty = target, True
+        if dirty:
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return changed
 
 
 def _remove_documents(work: Path) -> None:
