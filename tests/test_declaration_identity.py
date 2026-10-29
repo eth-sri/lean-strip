@@ -52,10 +52,10 @@ def test_olean_wire_format_preserves_both_endpoints():
 
         def write_file_bytes(self, path, payload):
             if path == olean._DUMP_KEEP_ROOT_PATH:
-                self.root = payload.decode().strip()
+                self.roots = payload.decode().splitlines()
 
         def execute_stream(self, command, *, on_output, **kwargs):
-            for module in (self.root,):
+            for module in self.roots:
                 on_output(f"DECL\tshared\t{module}\t2\t0\t2\t50\ttheorem\tnormal\n")
                 on_output(f"DEP\t{module}\tshared\t{module}\tonly{module}\n")
             return {"returncode": 0}

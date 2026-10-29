@@ -290,3 +290,59 @@ def test_isolated_olean_roots_preserve_imported_and_duplicate_dependencies(tmp_p
         ("A", "shared"): {("Base", "onlyBase")},
         ("B", "shared"): {("B", "onlyB")},
     }
+
+
+def test_batched_olean_roots_equal_one_process_per_root(tmp_path, monkeypatch):
+    from lean_strip._pipeline.preprocessing import olean
+    from lean_strip.workspace import LocalWorkspace
+
+    (tmp_path / "lean-toolchain").write_text(TOOLCHAIN)
+    sources = {
+        "Base": "axiom onlyBase : True\ndef Base.value : Nat := 1\n",
+        "Mid": "import Base\ntheorem Base.mid : Base.value = 1 := rfl\n",
+        "Top": "import Mid\ntheorem top : Base.value = 1 := Base.mid\n",
+        # Homonym definitions do not import together; the batch splits.
+        "DefA": "def clash : Nat := 1\ntheorem usesA : clash = 1 := rfl\n",
+        "DefB": "def clash : Nat := 2\ntheorem usesB : clash = 2 := rfl\n",
+        # A homonym theorem may be merged at import; its roots are isolated.
+        "ThmA": "import Base\ntheorem shared : True := onlyBase\n",
+        "ThmB": "axiom onlyB : True\ntheorem shared : True := onlyB\n",
+        "Free": "import Base\ntheorem free : Base.value = 1 := rfl\n",
+    }
+    (tmp_path / "lakefile.toml").write_text(
+        'name = "batched"\n' + "".join(f'[[lean_lib]]\nname = "{name}"\n' for name in sources)
+    )
+    for name, source in sources.items():
+        (tmp_path / f"{name}.lean").write_text(source)
+    subprocess.run(["lake", "build", *sources], cwd=tmp_path, check=True, capture_output=True)
+    ws = LocalWorkspace(tmp_path, tmp_path.parent / (tmp_path.name + "-scratch"),
+                        default_timeout=120, lean_threads=2)
+
+    batches = []
+    write_file_bytes = ws.write_file_bytes
+
+    def record_batch(path, payload):
+        if path == olean._DUMP_KEEP_ROOT_PATH:
+            batches.append(payload.decode().splitlines())
+        return write_file_bytes(path, payload)
+
+    monkeypatch.setattr(ws, "write_file_bytes", record_batch)
+
+    def extract():
+        decls, dependencies, namespaces = olean.read_olean_declarations(ws, list(sources), timeout=300)
+        return sorted(map(sorted, map(dict.items, decls))), dependencies, namespaces
+
+    batched = extract()
+    assert batches[0] == list(sources)
+    # The clash splits the first batch; the halves without it import cleanly
+    # and the merged theorem's modules come back alone.
+    names = list(sources)
+    assert batches[1:3] == [names[:4], names[4:]]
+    assert batches[3:] == [["ThmA"], ["ThmB"]]
+    monkeypatch.setattr(olean, "_ROOTS_PER_PROCESS", 1)
+    assert batched == extract()
+    _decls, dependencies, _namespaces = batched
+    assert dependencies[("ThmA", "shared")] == {("Base", "onlyBase")}
+    assert dependencies[("ThmB", "shared")] == {("ThmB", "onlyB")}
+    assert dependencies[("DefB", "usesB")] == {("DefB", "clash")}
+    assert ("Mid", "Base.mid") in dependencies[("Top", "top")]
