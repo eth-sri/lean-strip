@@ -247,11 +247,11 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
   -- environment, or if being one changes nothing: no prefix is a project
   -- declaration (no source owner) and its body names no project or ambiguous
   -- constant (no auxiliary owners). It is never a node or an edge target
-  -- either way. What remains is whether its namespaces count as imported,
-  -- which they do where a dependency copy is credited: a root that loads
-  -- only dependency copies adds them, one that loads only project copies does
-  -- not, and one that loads both, whose credit depends on import order, runs
-  -- alone unless the namespaces count as imported already.
+  -- either way. Its namespaces count as imported for every root that loads
+  -- a dependency copy: a dependency declares a constant in them. (In a
+  -- root's own environment that depends on which copy import order credits,
+  -- PALOMAR-2026-10-27-000003, where a root loading both would otherwise run
+  -- alone.)
   let sameConstant (a b : ConstantInfo) : Bool :=
     a.levelParams == b.levelParams && a.type == b.type && a.value? == b.value?
   let copyIn (modName cname : Name) : Option ConstantInfo := do
@@ -282,8 +282,9 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
   -- Names credited to a dependency module: a root that loads them sees an
   -- imported declaration, whose namespaces count as imported.
   let mut importedAmbiguous : Array (Name × Name) := #[]
-  -- Inert names: name, project declarers, dependency declarers.
-  let mut inertNames : Array (Name × Array Name × Array Name) := #[]
+  -- Inert names whose namespaces are not imported otherwise: name and its
+  -- dependency declarers.
+  let mut inertNames : Array (Name × Array Name) := #[]
   for (cname, (credited, copies)) in ambiguous.toList do
     let some shared := env.find? cname | do
       for (declarer, _) in copies do
@@ -320,8 +321,7 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
     if inert then
       if !prefixes.all importedNamespaces.contains then
         let declarers := #[credited] ++ copies.map (·.1)
-        inertNames := inertNames.push
-          (cname, declarers.filter projModNames.contains, declarers.filter (!projModNames.contains ·))
+        inertNames := inertNames.push (cname, declarers.filter (!projModNames.contains ·))
       continue
     let consistent := generated && if creditedProject then
         creditedSame && (ranged.all id || (ranged.all (!·) && allSame))
@@ -381,18 +381,11 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
         if separated then
           IO.println s!"ISOLATE\t{root}"
           continue
-        let mut orderDependent := false
-        for (_, projectDeclarers, otherDeclarers) in inertNames do
-          if projectDeclarers.any closure.contains && otherDeclarers.any closure.contains then
-            orderDependent := true
-        if orderDependent then
-          IO.println s!"ISOLATE\t{root}"
-          continue
         rootClosure := some closure
         for (cname, credited) in importedAmbiguous do
           if closure.contains credited then
             loadedImportedAmbiguous := loadedImportedAmbiguous.insert cname
-        for (cname, _, otherDeclarers) in inertNames do
+        for (cname, otherDeclarers) in inertNames do
           if otherDeclarers.any closure.contains then
             loadedImportedAmbiguous := loadedImportedAmbiguous.insert cname
     let closure? := rootClosure
