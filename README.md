@@ -90,8 +90,11 @@ The diagnostic `dependency-graph.json` uses schema `preprocessing_dependency_gra
 Declarations are identified by `(module, full Lean name)` throughout extraction,
 reachability and reporting, so independently built modules can provide separate
 copies of the same name with different dependencies and statuses. Kernel extraction
-queries each module in a fresh process, releasing imported `.olean` regions between
-roots. All roots share one timeout, and any failed root aborts the graph. `.ilean`
+queries modules in batches, one fresh process and environment per batch, and reports
+for each module what an environment of its own imports would give. A module whose
+imports reach a name that several loaded modules declare is queried again on its own,
+and a batch that fails is split until the failing module runs alone. All processes
+share one timeout, and any failed module aborts the graph. `.ilean`
 references retain their defining module. Edges use indexes into the physical `nodes`
 array. `ambiguous_edges` records source and target candidate indexes plus the evidence bitmask when a reference has
 multiple possible providers. Static discovery conservatively retains candidate targets;
