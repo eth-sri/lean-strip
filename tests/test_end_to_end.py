@@ -308,6 +308,10 @@ def test_batched_olean_roots_equal_one_process_per_root(tmp_path, monkeypatch):
         "ThmA": "import Base\ntheorem shared : True := onlyBase\n",
         "ThmB": "axiom onlyB : True\ntheorem shared : True := onlyB\n",
         "Free": "import Base\ntheorem free : Base.value = 1 := rfl\n",
+        # Each realizes its own copy of `Base.double.eq_1`; the copies agree.
+        "Double": "def Base.double (n : Nat) : Nat := n + n\n",
+        "UseX": "import Double\ntheorem useX : Base.double 1 = 2 := by rw [Base.double]\n",
+        "UseY": "import Double\ntheorem useY : Base.double 2 = 4 := by rw [Base.double]\n",
     }
     (tmp_path / "lakefile.toml").write_text(
         'name = "batched"\n' + "".join(f'[[lean_lib]]\nname = "{name}"\n' for name in sources)
@@ -336,9 +340,13 @@ def test_batched_olean_roots_equal_one_process_per_root(tmp_path, monkeypatch):
     assert batches[0] == list(sources)
     # The clash splits the first batch; the halves without it import cleanly
     # and the merged theorem's modules come back alone.
-    names = list(sources)
-    assert batches[1:3] == [names[:4], names[4:]]
-    assert batches[3:] == [["ThmA"], ["ThmB"]]
+    # The clash fails the first batch and splits it until DefA and DefB no
+    # longer share one. Apart from that, only the module whose copy of `shared`
+    # is not the credited one, and which does not import it, runs alone; the
+    # realized equation lemmas separate nothing.
+    alone = [batch[0] for batch in batches if len(batch) == 1]
+    assert "ThmB" in alone
+    assert not {"ThmA", "Double", "UseX", "UseY"} & set(alone), batches
     monkeypatch.setattr(olean, "_ROOTS_PER_PROCESS", 1)
     assert batched == extract()
     _decls, dependencies, _namespaces = batched

@@ -103,47 +103,35 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
 
   -- Several roots share this environment when the batch imports cleanly. Each
   -- root's output must equal what an environment of its own import closure
-  -- gives, and the two can differ only where a name is declared by more than
-  -- one loaded module and one of them is a project module: the shared
-  -- environment credits it to one copy, which a root's own environment may
-  -- not load. A root whose closure contains such a module is reported as
-  -- ISOLATE and is run again in a process of its own.
+  -- gives. The two can differ only at a name more than one loaded module
+  -- declares where one of them is a project module: the shared environment
+  -- credits one copy (and may hold another's value), which a root's own
+  -- environment may not load. Such names are classified after pass 1; a root
+  -- whose closure contains a module that makes its answer differ is reported
+  -- as ISOLATE and is run again in a process of its own.
   let batched := importArgs.length > 1
   let mut moduleIdx : Std.HashMap Name Nat := {}
   let mut moduleIdxByString : Std.HashMap String Nat := {}
   for i in [0:env.header.moduleNames.size] do
     moduleIdx := moduleIdx.insert env.header.moduleNames[i]! i
     moduleIdxByString := moduleIdxByString.insert env.header.moduleNames[i]!.toString i
-  let mut ambiguousModules : NameHashSet := {}
-  let mut ambiguousConsts : NameHashSet := {}
+  -- name -> (credited module, the other declaring modules with their copies),
+  -- for names with a project module among their declarers
+  let mut ambiguous : Std.HashMap Name (Name × Array (Name × ConstantInfo)) := {}
   if batched then
+    let mut declaredAgain : Std.HashMap Name (Name × Array (Name × ConstantInfo)) := {}
     for i in [0:env.header.moduleNames.size] do
       let declarer := env.header.moduleNames[i]!
       if let some data := env.header.moduleData[i]? then
-        for cname in data.constNames do
+        for cname in data.constNames, cinfo in data.constants do
           if let some idx := env.getModuleIdxFor? cname then
             let credited := env.header.moduleNames[idx]!
-            if credited != declarer && (projModNames.contains credited || projModNames.contains declarer) then
-              ambiguousModules := (ambiguousModules.insert credited).insert declarer
-              ambiguousConsts := ambiguousConsts.insert cname
-  -- The modules a root's own environment loads, and whether one of them is
-  -- ambiguous in this one.
-  let closureOf (start : Nat) : NameHashSet × Bool := Id.run do
-    let mut seen : NameHashSet := {}
-    let mut touchesAmbiguous := false
-    let mut stack : Array Nat := #[start]
-    while !stack.isEmpty do
-      let i := stack[stack.size - 1]!
-      stack := stack.pop
-      let modName := env.header.moduleNames[i]!
-      if seen.contains modName then continue
-      seen := seen.insert modName
-      if ambiguousModules.contains modName then touchesAmbiguous := true
-      if let some data := env.header.moduleData[i]? then
-        for imp in data.imports do
-          if let some j := moduleIdx[imp.module]? then
-            stack := stack.push j
-    return (seen, touchesAmbiguous)
+            if credited != declarer then
+              let (_, copies) := (declaredAgain[cname]?).getD (credited, #[])
+              declaredAgain := declaredAgain.insert cname (credited, copies.push (declarer, cinfo))
+    for (cname, (credited, copies)) in declaredAgain.toList do
+      if projModNames.contains credited || copies.any (fun (declarer, _) => projModNames.contains declarer) then
+        ambiguous := ambiguous.insert cname (credited, copies)
 
   -- Types that mark a decl as parsing/elaboration machinery (notation/macro).
   let metaConsts : List Name :=
@@ -165,8 +153,8 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
         | some modIdx =>
           let modName := env.header.moduleNames[modIdx]!
           projModNames.contains modName
-      -- An ambiguous name is reported by the isolated roots' own runs.
-      if !isProject && !ambiguousConsts.contains name then
+      -- Ambiguous names are added after pass 2, from the roots that load them.
+      if !isProject && !ambiguous.contains name then
         let mut namespaceName := name.getPrefix
         while !namespaceName.isAnonymous do
           importedNamespaces := importedNamespaces.insert namespaceName
@@ -239,6 +227,135 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
     return (nodes, projNameSet, importedNamespaces)
   let ((nodes, projNameSet, importedNamespaces), _) ← action.toIO coreCtx coreState
 
+  -- Classify the ambiguous names. Modules come after their imports in every
+  -- environment, and the first declarer loaded is credited. So a declarer
+  -- that imports the credited module never takes the credit from it, and a
+  -- root whose closure holds no other declarer sees the name credited as
+  -- here. Whether the rest of what a root sees agrees is checked per name;
+  -- where it does, only the declarers that do not import the credited module
+  -- set a root apart, and otherwise every declarer does:
+  -- * credited to a dependency module, with at most one project copy or
+  --   none with a range: the name is an imported constant wherever it is
+  --   credited as here, and is never a node.
+  -- * credited to a project module: its value must be the credited copy (a
+  --   root of the credited module loads no other), and either every project
+  --   copy has a range, so that each environment finds one, or none does
+  --   and every copy is the same constant, whose body auxOwners follows.
+  -- A name every copy of which is the same range-less constant (`foo.eq_1`,
+  -- `foo.congr_simp`, which Lean realizes in each module that first needs
+  -- them) sets no root apart at all if it is a project constant in every
+  -- environment, or if being one changes nothing: no prefix is a project
+  -- declaration (no source owner) and its body names no project or ambiguous
+  -- constant (no auxiliary owners). It is never a node or an edge target
+  -- either way. What remains is whether its namespaces count as imported,
+  -- which they do where a dependency copy is credited: a root that loads
+  -- only dependency copies adds them, one that loads only project copies does
+  -- not, and one that loads both, whose credit depends on import order, runs
+  -- alone unless the namespaces count as imported already.
+  let sameConstant (a b : ConstantInfo) : Bool :=
+    a.levelParams == b.levelParams && a.type == b.type && a.value? == b.value?
+  let copyIn (modName cname : Name) : Option ConstantInfo := do
+    let i ← moduleIdx[modName]?
+    let data ← env.header.moduleData[i]?
+    let j ← data.constNames.findIdx? (· == cname)
+    data.constants[j]?
+  let hasRange (modName cname : Name) : Bool := Id.run do
+    let some modIdx := env.getModuleIdx? modName | return false
+    return (declRangeExt.getModuleEntries env modIdx).any (·.1 == cname)
+  let imports (start target : Name) : Bool := Id.run do
+    let some first := moduleIdx[start]? | return false
+    let mut seen : NameHashSet := {}
+    let mut stack : Array Nat := #[first]
+    while !stack.isEmpty do
+      let i := stack[stack.size - 1]!
+      stack := stack.pop
+      let modName := env.header.moduleNames[i]!
+      if seen.contains modName then continue
+      if modName == target then return true
+      seen := seen.insert modName
+      if let some data := env.header.moduleData[i]? then
+        for imp in data.imports do
+          if let some j := moduleIdx[imp.module]? then
+            stack := stack.push j
+    return false
+  let mut separating : NameHashSet := {}
+  -- Names credited to a dependency module: a root that loads them sees an
+  -- imported declaration, whose namespaces count as imported.
+  let mut importedAmbiguous : Array (Name × Name) := #[]
+  -- Inert names: name, project declarers, dependency declarers.
+  let mut inertNames : Array (Name × Array Name × Array Name) := #[]
+  for (cname, (credited, copies)) in ambiguous.toList do
+    let some shared := env.find? cname | do
+      for (declarer, _) in copies do
+        separating := separating.insert declarer
+      separating := separating.insert credited
+    let creditedSame := match copyIn credited cname with
+      | some own => sameConstant shared own
+      | none => false
+    let allSame := creditedSame && copies.all (fun (_, copy) => sameConstant shared copy)
+    let projectCopies := copies.filter (fun (declarer, _) => projModNames.contains declarer)
+    let generated := !isAuxRecursor env cname && !isNoConfusion env cname
+    let creditedProject := projModNames.contains credited
+    let projectDeclarers := (if creditedProject then #[credited] else #[]) ++ projectCopies.map (·.1)
+    let ranged := projectDeclarers.map (hasRange · cname)
+    let benign := generated && allSame && creditedProject && projectCopies.size == copies.size
+      && ranged.all (!·)
+    if benign then continue
+    let prefixes := Id.run do
+      let mut out : Array Name := #[]
+      let mut namespaceName := cname.getPrefix
+      while !namespaceName.isAnonymous do
+        out := out.push namespaceName
+        namespaceName := namespaceName.getPrefix
+      return out
+    let body := match shared.value? with
+      | some value => #[shared.type, value]
+      | none => #[shared.type]
+    let named := body.foldl (fun acc e => e.foldConsts acc fun c acc => acc.push c) #[]
+    let inert := generated && allSame && ranged.all (!·) && !projNameSet.contains cname
+      && prefixes.all (fun p => !projNameSet.contains p)
+      && named.all (fun c => !ambiguous.contains c && !(match env.getModuleIdxFor? c with
+        | some modIdx => projModNames.contains env.header.moduleNames[modIdx]!
+        | none => false))
+    if inert then
+      if !prefixes.all importedNamespaces.contains then
+        let declarers := #[credited] ++ copies.map (·.1)
+        inertNames := inertNames.push
+          (cname, declarers.filter projModNames.contains, declarers.filter (!projModNames.contains ·))
+      continue
+    let consistent := generated && if creditedProject then
+        creditedSame && (ranged.all id || (ranged.all (!·) && allSame))
+      else
+        projectCopies.size ≤ 1 || ranged.all (!·)
+    if consistent then
+      for (declarer, _) in copies do
+        if !imports declarer credited then
+          separating := separating.insert declarer
+      if !creditedProject then
+        importedAmbiguous := importedAmbiguous.push (cname, credited)
+    else
+      for (declarer, _) in copies do
+        separating := separating.insert declarer
+      separating := separating.insert credited
+  -- The modules a root's own environment loads, and whether one of them sets
+  -- it apart from this one.
+  let closureOf (start : Nat) : NameHashSet × Bool := Id.run do
+    let mut seen : NameHashSet := {}
+    let mut separated := false
+    let mut stack : Array Nat := #[start]
+    while !stack.isEmpty do
+      let i := stack[stack.size - 1]!
+      stack := stack.pop
+      let modName := env.header.moduleNames[i]!
+      if seen.contains modName then continue
+      seen := seen.insert modName
+      if separating.contains modName then separated := true
+      if let some data := env.header.moduleData[i]? then
+        for imp in data.imports do
+          if let some j := moduleIdx[imp.module]? then
+            stack := stack.push j
+    return (seen, separated)
+
   -- Pass 2: emit DECL + DEP for each node of each root.
   let isProjectConstant (n : Name) : Bool :=
     match env.getModuleIdxFor? n with
@@ -250,6 +367,7 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
   for node in nodes do
     let key := node.2.1.toString
     nodesByModule := nodesByModule.insert key (((nodesByModule[key]?).getD #[]).push node)
+  let mut loadedImportedAmbiguous : NameHashSet := {}
   for root in importArgs do
     -- `none`: this environment is the root's own, and everything it loads counts.
     let mut rootClosure : Option NameHashSet := none
@@ -259,11 +377,24 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
         IO.println s!"ISOLATE\t{root}"
         continue
       | some idx =>
-        let (closure, touchesAmbiguous) := closureOf idx
-        if touchesAmbiguous then
+        let (closure, separated) := closureOf idx
+        if separated then
+          IO.println s!"ISOLATE\t{root}"
+          continue
+        let mut orderDependent := false
+        for (_, projectDeclarers, otherDeclarers) in inertNames do
+          if projectDeclarers.any closure.contains && otherDeclarers.any closure.contains then
+            orderDependent := true
+        if orderDependent then
           IO.println s!"ISOLATE\t{root}"
           continue
         rootClosure := some closure
+        for (cname, credited) in importedAmbiguous do
+          if closure.contains credited then
+            loadedImportedAmbiguous := loadedImportedAmbiguous.insert cname
+        for (cname, _, otherDeclarers) in inertNames do
+          if otherDeclarers.any closure.contains then
+            loadedImportedAmbiguous := loadedImportedAmbiguous.insert cname
     let closure? := rootClosure
     let inClosure (n : Name) : Bool :=
       match closure? with
@@ -331,6 +462,13 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
       for ref in refs do
         if let some idx := env.getModuleIdxFor? ref then
           IO.println s!"DEP\t{modName}\t{name}\t{env.header.moduleNames[idx]!}\t{ref}"
+  let mut importedNamespaces := importedNamespaces
+  for cname in importedAmbiguous.map (·.1) ++ inertNames.map (·.1) do
+    if loadedImportedAmbiguous.contains cname then
+      let mut namespaceName := cname.getPrefix
+      while !namespaceName.isAnonymous do
+        importedNamespaces := importedNamespaces.insert namespaceName
+        namespaceName := namespaceName.getPrefix
   for ns in importedNamespaces do
     IO.println s!"EXTNS\t{ns}"
 
