@@ -131,13 +131,15 @@ def project_source_dirs(env: Any) -> list[str] | None:
 def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
                              modules: list[str] | None = None,
                              timeout: int = 3600,
+                             workers: int = 1,
                              allow_missing_sources: bool = False,
                              allow_empty: bool = False) -> DependencyGraph:
     """Collect all static evidence from an already built, matching source state.
 
     A failed .olean query or incomplete .ilean set is an error, not an empty
     graph. Source mapping is required unless ``allow_missing_sources`` is set;
-    ``modules=None`` discovers every built project module.
+    ``modules=None`` discovers every built project module. ``workers`` bounds
+    the Lean processes that read .olean files at once.
     """
     if modules is None:
         modules = discover_modules(env)
@@ -147,7 +149,7 @@ def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
     if not modules:
         raise RuntimeError("No project modules discovered for dependency graph")
     declarations, kernel, namespaces = read_olean_declarations(
-        env, modules=modules, timeout=timeout)
+        env, modules=modules, timeout=timeout, workers=workers)
     if not declarations and allow_empty:
         return DependencyGraph([], {}, namespaces, originals, {}, {},
                                {"kernel": set(), "ilean": set(), "source_text": set()})

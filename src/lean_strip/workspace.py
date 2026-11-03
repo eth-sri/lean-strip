@@ -62,6 +62,9 @@ class LocalWorkspace:
             "LC_ALL": "C",
             "LEAN_NUM_THREADS": str(lean_threads),
         }
+        # Process groups of the commands running now, from any thread.
+        self._running: set[int] = set()
+        self._running_lock = threading.Lock()
 
     @property
     def environment(self) -> dict[str, str]:
@@ -126,6 +129,8 @@ class LocalWorkspace:
             bufsize=1,
             start_new_session=True,
         )
+        with self._running_lock:
+            self._running.add(process.pid)
         lines: list[str] = []
 
         def reader() -> None:
@@ -163,6 +168,9 @@ class LocalWorkspace:
             terminate()
             thread.join()
             raise
+        finally:
+            with self._running_lock:
+                self._running.discard(process.pid)
         thread.join()
         output = "".join(lines)
         self._log(
@@ -170,6 +178,17 @@ class LocalWorkspace:
             + (" (timed out)" if timed_out else "")
         )
         return {"output": output, "returncode": process.returncode, "timed_out": timed_out}
+
+    def cancel_running(self) -> None:
+        """Kill every command that another thread is running now."""
+
+        with self._running_lock:
+            groups = list(self._running)
+        for group in groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def run_argv(self, argv: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess:
         """Run an argv (container paths allowed) in the project directory."""

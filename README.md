@@ -49,7 +49,7 @@ The comparator config is found automatically when the repository has exactly one
 - `--container [podman|docker]`: run inside a container; the repository is mounted, not copied.
 - `--memory SIZE`, `--cpus N`: with `--container`, limit memory (no swap) and CPUs.
 - `--image IMAGE`: with `--container`, the image to run in (default: built on first use).
-- `--jobs N`: Lean threads and parallel files (default 8, or `--cpus`).
+- `--jobs N`: Lean threads, parallel files and parallel graph processes (default 8, or `--cpus`).
 - `--timeout SECONDS`: per-command timeout (default 21600).
 - `--keep-work`: keep `.lean-strip/work` after a successful run.
 - `--quiet`: print only the final summary.

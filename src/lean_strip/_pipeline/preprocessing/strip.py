@@ -138,9 +138,9 @@ class _VisibleNames:
         self._names = names
         self._closure = closure
         self._visible: dict[str, bool] = {}
-        self.by_display = _VisibleIndex(names.by_display, self)
-        self.by_last = _VisibleIndex(names.by_last, self)
-        self.by_suffix = _VisibleIndex(names.by_suffix, self)
+        self.by_display = _VisibleIndex(names.by_display, names.grouped["display"], self)
+        self.by_last = _VisibleIndex(names.by_last, names.grouped["last"], self)
+        self.by_suffix = _VisibleIndex(names.by_suffix, names.grouped["suffix"], self)
 
     def __contains__(self, name: object) -> bool:
         if not isinstance(name, str):
@@ -157,21 +157,55 @@ class _VisibleNames:
             self._visible[name] = known
         return known
 
+    def select(self, groups: dict[str, list[str]]) -> frozenset[str]:
+        """The names of ``groups`` (by declaring module) that are visible."""
+
+        owners = self._names.private_owner
+        return frozenset(
+            name
+            for module in groups.keys() & self._closure
+            for name in groups[module]
+            if owners.get(name) in (None, self.module)
+        )
+
+
+# Keys with more names than this are filtered through the closure by module.
+# A last component such as `eq_1` or `mk` names thousands of declarations, and
+# testing each for every module that looks it up was 24 million membership
+# tests on QRH SIL.
+_GROUPED_LOOKUP = 8
+
 
 class _VisibleIndex:
     """One project-wide name index, filtered to one module's visible names."""
 
-    def __init__(self, index: dict[str, list[str]], visible: _VisibleNames) -> None:
+    def __init__(self, index: dict[str, list[str]], grouped: dict[str, dict[str, list[str]]],
+                 visible: _VisibleNames) -> None:
         self._index = index
+        self._grouped = grouped
         self._visible = visible
         self._cache: dict[str, frozenset[str]] = {}
 
     def get(self, key: str, default: Any = None) -> Any:
         hits = self._cache.get(key)
         if hits is None:
-            hits = frozenset(name for name in self._index.get(key, ()) if name in self._visible)
+            names = self._index.get(key, ())
+            if len(names) > _GROUPED_LOOKUP:
+                groups = self._grouped.get(key)
+                if groups is None:
+                    groups = self._grouped[key] = {}
+                    modules_of = self._visible._names.modules_of
+                    for name in names:
+                        for module in modules_of[name]:
+                            groups.setdefault(module, []).append(name)
+                hits = self._visible.select(groups)
+            else:
+                hits = frozenset(name for name in names if name in self._visible)
             self._cache[key] = hits
         return hits if hits else default
+
+
+_NO_PREFIXES: frozenset[str] = frozenset()
 
 
 class _ProjectNames:
@@ -193,6 +227,14 @@ class _ProjectNames:
         self.by_display: dict[str, list[str]] = {}
         self.by_last: dict[str, list[str]] = {}
         self.by_suffix: dict[str, list[str]] = {}
+        # For each dotted suffix, the prefixes it follows: `p` is in
+        # `prefixes[s]` exactly when some display name is `p.s`.
+        self.prefixes: dict[str, set[str]] = {}
+        # Long index entries by declaring module, built on first lookup and
+        # shared by every module's view.
+        self.grouped: dict[str, dict[str, dict[str, list[str]]]] = {
+            "display": {}, "last": {}, "suffix": {},
+        }
         for name in self.modules_of:
             owner, display = _private_owner_and_display(name)
             if owner is not None:
@@ -202,6 +244,7 @@ class _ProjectNames:
             for index, char in enumerate(display):
                 if char == "." and index + 1 < len(display):
                     self.by_suffix.setdefault(display[index + 1 :], []).append(name)
+                    self.prefixes.setdefault(display[index + 1 :], set()).add(display[:index])
 
     def visible_from(self, module: str, closure: set[str]) -> _VisibleNames:
         return _VisibleNames(self, module, closure)
@@ -319,10 +362,15 @@ def augment_deps_with_source(
     # A quoted name is matched against every project declaration (see below).
     all_names = {str(decl["name"]) for decl in decls}
     view: _VisibleNames | None = None
+    # The visible names `tok` denotes under each namespace of `opens`, for the
+    # current module, whose tokens and opens repeat across declarations. Trying
+    # every opened namespace for every token was 122 million lookups on QRH SIL.
+    opened_cache: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
     for index in [index for indexes in indexes_by_module.values() for index in indexes]:
         d = decls[index]
         if view is not None and view.module != d["module"]:
             view = None
+            opened_cache.clear()
             source_lines_by_path.clear()
         if d["start_line"] is None:
             continue
@@ -404,12 +452,16 @@ def augment_deps_with_source(
             if resolved_name is not None:
                 edges.add(resolved_name)
                 continue
-            opened_hits = {
-                resolved
-                for namespace in lexical_opens
-                for resolved in by_display.get(f"{namespace}.{tok}", set())
-                if resolved != d["name"]
-            }
+            opened = opened_cache.get((tok, lexical_opens))
+            if opened is None:
+                # Only the opened namespaces some display name `namespace.tok`
+                # is in; the others' lookups find nothing.
+                opened = opened_cache[tok, lexical_opens] = frozenset(
+                    resolved
+                    for namespace in names.prefixes.get(tok, _NO_PREFIXES).intersection(lexical_opens)
+                    for resolved in by_display.get(f"{namespace}.{tok}", set())
+                )
+            opened_hits = opened - {d["name"]}
             if len(opened_hits) == 1:
                 edges.add(next(iter(opened_hits)))
                 continue
@@ -1769,6 +1821,13 @@ def file_has_kept_decl(decl_ranges: list[DeclRange]) -> bool:
     return any(r["keep"] and r["start_line"] is not None for r in decl_ranges)
 
 
+# The next character that changes `_mask_comments_preserve_layout`'s state.
+_MASK_CODE_EVENT_RE = re.compile(r'--|/-|"')
+_MASK_NEST_EVENT_RE = re.compile(r"/-|-/")
+_MASK_STRING_EVENT_RE = re.compile(r'[\\"]')
+_MASK_CHAR_RE = re.compile(r"[^\n]")
+
+
 def _mask_comments_preserve_layout(
     text: str, *, mask_strings: bool = False
 ) -> str:
@@ -1778,61 +1837,67 @@ def _mask_comments_preserve_layout(
     lines between a command prefix and its declaration are only comment/blank
     trivia without losing the original declaration line numbers. Lean block
     comments nest, and comment markers inside strings are ordinary characters.
+
+    Text between two state changes is copied or blanked as a whole: per
+    character, this ran for 40 s on QRH SIL's sources.
     """
+
+    def blank(chunk: str) -> str:
+        return _MASK_CHAR_RE.sub(" ", chunk)
+
+    def string_text(chunk: str) -> str:
+        return blank(chunk) if mask_strings else chunk
+
     out: list[str] = []
     i = 0
-    nest = 0
-    in_line = False
-    in_string = False
-    while i < len(text):
-        char = text[i]
-        nxt = text[i + 1] if i + 1 < len(text) else ""
-        if in_line:
-            if char == "\n":
-                in_line = False
+    size = len(text)
+    while i < size:
+        # Code: copied up to a line comment, a block comment or a string.
+        match = _MASK_CODE_EVENT_RE.search(text, i)
+        if match is None:
+            out.append(text[i:])
+            break
+        out.append(text[i:match.start()])
+        event = match.group()
+        i = match.end()
+        if event == "--":
+            newline = text.find("\n", i)
+            stop = size if newline < 0 else newline
+            out.append(" " * (stop - match.start()))
+            if newline >= 0:
                 out.append("\n")
+                i = newline + 1
             else:
-                out.append(" ")
-            i += 1
-            continue
-        if nest:
-            if char == "/" and nxt == "-":
-                nest += 1
-                out.extend((" ", " "))
-                i += 2
-                continue
-            if char == "-" and nxt == "/":
-                nest -= 1
-                out.extend((" ", " "))
-                i += 2
-                continue
-            out.append("\n" if char == "\n" else " ")
-            i += 1
-            continue
-        if in_string:
-            out.append(" " if mask_strings and char != "\n" else char)
-            if char == "\\" and nxt:
-                out.append(" " if mask_strings and nxt != "\n" else nxt)
-                i += 2
-                continue
-            if char == '"':
-                in_string = False
-            i += 1
-            continue
-        if char == "-" and nxt == "-":
-            in_line = True
-            out.extend((" ", " "))
-            i += 2
-            continue
-        if char == "/" and nxt == "-":
+                i = size
+        elif event == "/-":
+            out.append("  ")
             nest = 1
-            out.extend((" ", " "))
-            i += 2
-            continue
-        if char == '"':
-            in_string = True
-        out.append(" " if mask_strings and in_string else char)
-        i += 1
+            while nest and i < size:
+                inner = _MASK_NEST_EVENT_RE.search(text, i)
+                stop = size if inner is None else inner.start()
+                out.append(blank(text[i:stop]))
+                if inner is None:
+                    i = size
+                    break
+                nest += 1 if inner.group() == "/-" else -1
+                out.append("  ")
+                i = inner.end()
+        else:
+            out.append(" " if mask_strings else '"')
+            while i < size:
+                inner = _MASK_STRING_EVENT_RE.search(text, i)
+                if inner is None:
+                    out.append(string_text(text[i:]))
+                    i = size
+                    break
+                out.append(string_text(text[i:inner.start()]))
+                i = inner.end()
+                if inner.group() == '"':
+                    out.append(" " if mask_strings else '"')
+                    break
+                # A backslash and the character it escapes, if any.
+                out.append(string_text("\\" + text[i:i + 1]))
+                i += 1 if i < size else 0
     return "".join(out)
 
 

@@ -986,7 +986,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
     with stage("Dependency graph") as _t:
         _t.progress("reading declarations and references from .olean/.ilean files")
         graph = collect_dependency_graph(
-            ws, originals, modules=None, timeout=timeout,
+            ws, originals, modules=None, timeout=timeout, workers=settings.file_workers,
             allow_missing_sources=True, allow_empty=True,
         )
         decls, deps, imported_namespaces = (

@@ -12,6 +12,12 @@ from lean_strip._pipeline.preprocessing import dependency_graph, olean
 from lean_strip.workspace import LocalWorkspace
 
 
+@pytest.fixture(autouse=True)
+def interpreted(monkeypatch):
+    """These tests drive a fake `lean --run`; the native build has its own."""
+    monkeypatch.setattr(olean, "_compile_dump_keep_script", lambda env, *, timeout: False)
+
+
 @pytest.fixture
 def workspace(tmp_path):
     project = tmp_path / "project"

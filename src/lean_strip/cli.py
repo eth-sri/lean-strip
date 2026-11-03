@@ -651,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="strip in the scratch workspace only; do not touch the repository")
     parser.add_argument("--force", action="store_true", help="run even if the repository has uncommitted .lean or lakefile changes (any changes with --retain-lean-only)")
     parser.add_argument("--keep-work", action="store_true", help="keep .lean-strip/work after a successful run")
-    parser.add_argument("--jobs", type=int, help="LEAN_NUM_THREADS and parallel grind files (default: 8, or --cpus in a container)")
+    parser.add_argument("--jobs", type=int, help="LEAN_NUM_THREADS, parallel grind files and parallel graph processes (default: 8, or --cpus in a container)")
     parser.add_argument("--timeout", type=int, default=21600, help="per-command timeout in seconds (default: 21600)")
     parser.add_argument("--quiet", action="store_true", help="only print the final summary")
     parser.add_argument("--clean-certify", action="store_true", help="also rebuild the stripped project from a clean .lake/build before accepting it")

@@ -8,6 +8,8 @@ random inputs.
 
 import random
 
+import pytest
+
 from lean_strip._pipeline.preprocessing import ilean, strip
 
 
@@ -43,7 +45,9 @@ def test_enclosing_declarations_match_the_pairwise_comparison():
         assert [set(found) for found in strip._enclosing_declarations(decls)] == expected
 
 
-def test_visible_names_match_a_per_module_index():
+@pytest.mark.parametrize("grouped_above", [strip._GROUPED_LOOKUP, 0])
+def test_visible_names_match_a_per_module_index(monkeypatch, grouped_above):
+    monkeypatch.setattr(strip, "_GROUPED_LOOKUP", grouped_above)
     rng = random.Random(2)
     components = ["A", "B", "foo", "bar", "comm", "x"]
     for _ in range(100):

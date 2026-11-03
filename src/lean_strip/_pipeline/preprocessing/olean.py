@@ -8,6 +8,8 @@ from __future__ import annotations
 import shlex
 import time
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from typing import Any
 
 from .identity import Dependencies
@@ -92,7 +94,7 @@ partial def auxOwners (env : Environment) (isProject : Name → Bool)
   memo.modify (·.insert n out)
   return out
 
-unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
+unsafe def dumpModule (moduleArgs importArgs : List String) (known : Std.HashSet String) : IO Unit := do
   let imports := (importArgs.map fun s => { module := s.toName : Import }).toArray
   let env ← importModules imports {} 0
   let loadedModules := env.header.moduleNames
@@ -462,11 +464,20 @@ unsafe def dumpModule (moduleArgs importArgs : List String) : IO Unit := do
       while !namespaceName.isAnonymous do
         importedNamespaces := importedNamespaces.insert namespaceName
         namespaceName := namespaceName.getPrefix
+  -- `known` holds namespaces an earlier process already reported; the
+  -- caller unions them, so repeating them only costs output.
   for ns in importedNamespaces do
-    IO.println s!"EXTNS\t{ns}"
+    let line := ns.toString
+    if !known.contains line then
+      IO.println s!"EXTNS\t{line}"
 
 unsafe def main (args : List String) : IO Unit := do
   initSearchPath (← findSysroot)
+  let (args, known) ← match args with
+    | [m, p, r, q, "--known-namespaces-file", path] => do
+      let lines := (← IO.FS.readFile path).splitOn "\n" |>.filter (fun s => !s.isEmpty)
+      pure ([m, p, r, q], lines.foldl (·.insert ·) ({} : Std.HashSet String))
+    | _ => pure (args, {})
   let (moduleArgs, importArgs) ←
     match args with
     | ["--modules-file", path] => do
@@ -485,7 +496,7 @@ unsafe def main (args : List String) : IO Unit := do
   -- Environment is no longer used.
   if importArgs.isEmpty then
     throw <| IO.userError "expected at least one root module"
-  dumpModule moduleArgs importArgs
+  dumpModule moduleArgs importArgs known
 """.strip()
 
 # Logical scratch paths (mapped to the local workspace) for the script and its
@@ -493,6 +504,14 @@ unsafe def main (args : List String) : IO Unit := do
 _DUMP_KEEP_PATH = "/tmp/_dump_keep.lean"
 _DUMP_KEEP_MODULES_PATH = "/tmp/_dump_keep_modules.txt"
 _DUMP_KEEP_ROOT_PATH = "/tmp/_dump_keep_root.txt"
+# Namespaces already reported, which later processes leave out (written once,
+# before any process that reads it starts).
+_DUMP_KEEP_NAMESPACES_PATH = "/tmp/_dump_keep_namespaces.txt"
+# The script compiled to a native program, and the environment `lake env`
+# gives it. Written next to the script, which `lean -c` needs under its cwd.
+_DUMP_KEEP_BINARY_PATH = "/tmp/_dump_keep.bin"
+_DUMP_KEEP_ENV_PATH = "/tmp/_dump_keep.env"
+_NATIVE_READY = "LEANDUMPKEEP_NATIVE_READY"
 
 # Roots per Lean process. Each process imports Mathlib and its other
 # dependencies once, so one process per root costs a full import per module
@@ -500,6 +519,9 @@ _DUMP_KEEP_ROOT_PATH = "/tmp/_dump_keep_root.txt"
 # budget). A batch's environment is the union of its roots' closures, which is
 # no larger than the whole project's.
 _ROOTS_PER_PROCESS = 128
+
+# Upper bound on the native compile; past it the interpreter is used instead.
+_COMPILE_TIMEOUT = 600
 
 # One declaration: name, module, source range, kind, meta flag. Other layers
 # add a `keep` bool; anonymous-example rows use the same shape.
@@ -515,6 +537,34 @@ def _install_dump_keep_script(env: Any, *, timeout: float) -> None:
             returncode=result.get("returncode"), timed_out=result.get("timed_out"),
             diagnostics=result.get("output", "")[-4000:], declarations=0,
         )
+
+
+def _compile_dump_keep_script(env: Any, *, timeout: float) -> bool:
+    """Compile the installed script natively; False keeps `lake env lean --run`.
+
+    Under `lean --run` every process elaborates the script again and
+    interprets its passes over all imported constants, and every `lake env`
+    re-checks each package (QRH SIL, 4,358 modules: 9.4 s per isolated root
+    against 2.8 s compiled and run with the captured environment). The program
+    is the same Lean code and the environment is the one `lake env` exports,
+    so the records are the same. Any failure here only costs speed.
+    """
+    inner = (
+        f"export -p > {_DUMP_KEEP_ENV_PATH}"
+        " && cd /tmp/ && lean -c _dump_keep.c _dump_keep.lean"
+        ' && libdir="$(lean --print-libdir)"'
+        " && leanc -O3 -DNDEBUG -o _dump_keep.bin _dump_keep.c"
+        ' -L"$libdir" -lleanshared -Wl,-rpath,"$libdir"'
+        # The roots source it under bash; it must not fail there.
+        f" && bash -c '. {_DUMP_KEEP_ENV_PATH}'"
+        f" && echo {_NATIVE_READY}"
+    )
+    cmd = "cd /testbed && lake env sh -c " + shlex.quote(inner)
+    result = env.execute(cmd, timeout=min(timeout, _COMPILE_TIMEOUT))
+    return (
+        result.get("returncode", 1) == 0 and not result.get("timed_out")
+        and _NATIVE_READY in (result.get("output") or "")
+    )
 
 
 class DeclGraphExtractionError(RuntimeError):
@@ -533,8 +583,25 @@ class DeclGraphExtractionError(RuntimeError):
         )
 
 
+@dataclass
+class _Batch:
+    """One Lean process's roots and, once it has run, what it answered.
+
+    A batch that failed has its halves as children and contributes nothing
+    itself; one that succeeded has its ISOLATE roots as children. Declarations
+    and edges are assembled in pre-order, the order of one process at a time;
+    namespaces, a set, are merged as soon as the batch succeeds.
+    """
+
+    roots: list[str]
+    decls: list[DeclRange] = field(default_factory=list)
+    deps: list[tuple[tuple[str, str], tuple[str, str]]] = field(default_factory=list)
+    namespaces: set[str] = field(default_factory=set)
+    children: list["_Batch"] = field(default_factory=list)
+
+
 def read_olean_declarations(
-    env: Any, modules: list[str], *, timeout: int = 3600,
+    env: Any, modules: list[str], *, timeout: int = 3600, workers: int = 1,
 ) -> tuple[list[DeclRange], Dependencies, set[str]]:
     """Run the keep-graph Lean script; return declarations, edges, namespaces.
 
@@ -551,9 +618,11 @@ def read_olean_declarations(
     closure. A root that a shared environment cannot answer for (the Lean
     script reports it as ISOLATE) runs again alone, and a batch that fails
     is split in halves, so a failure is reported for the single root that
-    fails alone. A failed batch contributes nothing. Output is streamed; all
-    processes and script setup share one timeout. No graph is returned unless
-    every root succeeds within that budget.
+    fails alone. A failed batch contributes nothing. Up to `workers` processes
+    run at once; the records are assembled in the order one process at a time
+    produces them. Output is streamed; all processes and script setup share
+    one timeout. No graph is returned unless every root succeeds within that
+    budget.
 
     Requires `lake build` to have succeeded so .olean files exist.
     Raises DeclGraphExtractionError if the query fails.
@@ -561,41 +630,45 @@ def read_olean_declarations(
     modules = list(dict.fromkeys(modules))
     if not modules:
         return [], {}, set()
+    workers = max(1, workers)
     deadline = time.monotonic() + timeout
-    decls: list[DeclRange] = []
-    deps: Dependencies = {}
-    imported_namespaces: set[str] = set()
+    # Declarations of the batches that have succeeded so far, for error details
+    # (updated by the scheduling thread only).
+    finished = [0]
 
     def remaining(root_module: str | None = None, pending: int = 0) -> float:
         seconds = deadline - time.monotonic()
         if seconds <= 0:
             raise DeclGraphExtractionError(
                 returncode=None, timed_out=True, diagnostics="overall extraction timeout exhausted",
-                declarations=len(decls) + pending, root_module=root_module,
+                declarations=finished[0] + pending, root_module=root_module,
             )
         return seconds
 
     _install_dump_keep_script(env, timeout=remaining())
+    native = _compile_dump_keep_script(env, timeout=remaining())
 
     payload = ("\n".join(modules) + "\n").encode("utf-8")
     env.write_file_bytes(_DUMP_KEEP_MODULES_PATH, payload)
-    lean_command = (
-        f"lean --run {_DUMP_KEEP_PATH} "
-        f"--modules-file {_DUMP_KEEP_MODULES_PATH} "
-        f"--roots-file {_DUMP_KEEP_ROOT_PATH}"
-    )
-    # One invocation per batch releases Lean's imports on exit. The workspace
-    # cancels the entire Lake/Lean process group if the shared budget expires.
-    cmd = "cd /testbed && lake env sh -c " + shlex.quote("exec " + lean_command)
-    queue = deque(
-        modules[index:index + _ROOTS_PER_PROCESS]
-        for index in range(0, len(modules), _ROOTS_PER_PROCESS)
-    )
-    while queue:
-        batch = queue.popleft()
-        batch_decls: list[DeclRange] = []
-        batch_deps: list[tuple[tuple[str, str], tuple[str, str]]] = []
-        batch_namespaces: set[str] = set()
+
+    # Every process reports the namespaces of all of Mathlib again (150,000
+    # lines per QRH SIL root); after the first batch, only new ones.
+    known: list[str | None] = [None]
+
+    def command(roots_path: str) -> str:
+        arguments = f"--modules-file {_DUMP_KEEP_MODULES_PATH} --roots-file {roots_path}"
+        if known[0] is not None:
+            arguments += f" --known-namespaces-file {known[0]}"
+        if native:
+            return f"cd /testbed && . {_DUMP_KEEP_ENV_PATH} && exec {_DUMP_KEEP_BINARY_PATH} {arguments}"
+        # One invocation per batch releases Lean's imports on exit. The
+        # workspace cancels the entire Lake/Lean process group if the shared
+        # budget expires.
+        return "cd /testbed && lake env sh -c " + shlex.quote(
+            f"exec lean --run {_DUMP_KEEP_PATH} {arguments}")
+
+    def run(batch: _Batch, slot: int) -> None:
+        """Run one batch in a process of its own; set its records or children."""
         isolated: list[str] = []
         diagnostics: list[str] = []
 
@@ -605,7 +678,7 @@ def read_olean_declarations(
             if parts and parts[0] == "DECL" and len(parts) == 9:
                 _, name, module, sl, sc, el, ec, kind, meta = parts
                 try:
-                    batch_decls.append({
+                    batch.decls.append({
                         "name": name, "module": module,
                         "start_line": int(sl), "start_col": int(sc),
                         "end_line": int(el), "end_col": int(ec),
@@ -614,9 +687,9 @@ def read_olean_declarations(
                 except ValueError:
                     diagnostics.append(line)
             elif parts and parts[0] == "DEP" and len(parts) == 5:
-                batch_deps.append(((parts[1], parts[2]), (parts[3], parts[4])))
+                batch.deps.append(((parts[1], parts[2]), (parts[3], parts[4])))
             elif parts and parts[0] == "EXTNS" and len(parts) == 2:
-                batch_namespaces.add(parts[1])
+                batch.namespaces.add(parts[1])
             elif parts and parts[0] == "ISOLATE" and len(parts) == 2:
                 isolated.append(parts[1])
             elif line:
@@ -624,42 +697,91 @@ def read_olean_declarations(
             if len(diagnostics) > 200:
                 del diagnostics[:-200]
 
-        root_module = batch[0] if len(batch) == 1 else None
-        env.write_file_bytes(_DUMP_KEEP_ROOT_PATH, ("\n".join(batch) + "\n").encode("utf-8"))
+        roots = batch.roots
+        root_module = roots[0] if len(roots) == 1 else None
+        roots_path = _DUMP_KEEP_ROOT_PATH if slot == 0 else f"/tmp/_dump_keep_root.{slot}.txt"
+        env.write_file_bytes(roots_path, ("\n".join(roots) + "\n").encode("utf-8"))
         result = env.execute_stream(
-            cmd,
+            command(roots_path),
             timeout=remaining(root_module),
             on_output=consume_line,
             capture_output=False,
         )
         failed = result.get("returncode", 1) != 0 or result.get("timed_out")
-        if failed and len(batch) > 1 and not result.get("timed_out"):
-            half = len(batch) // 2
-            queue.extendleft([batch[half:], batch[:half]])
-            continue
+        if failed and len(roots) > 1 and not result.get("timed_out"):
+            half = len(roots) // 2
+            batch.decls, batch.deps, batch.namespaces = [], [], set()
+            batch.children = [_Batch(roots[:half]), _Batch(roots[half:])]
+            return
         if failed:
             detail = "\n".join(diagnostics)[-4000:] or result.get("output", "")[-4000:]
             raise DeclGraphExtractionError(
                 returncode=result.get("returncode"), timed_out=result.get("timed_out"),
-                diagnostics=detail, declarations=len(decls) + len(batch_decls), root_module=root_module,
+                diagnostics=detail, declarations=finished[0] + len(batch.decls), root_module=root_module,
             )
-        if len(batch) == 1 and isolated:
+        if len(roots) == 1 and isolated:
             raise DeclGraphExtractionError(
                 returncode=result.get("returncode"), timed_out=False,
                 diagnostics=f"a single root was reported as ISOLATE: {isolated}",
-                declarations=len(decls), root_module=root_module,
+                declarations=finished[0], root_module=root_module,
             )
-        unknown = set(isolated) - set(batch)
+        unknown = set(isolated) - set(roots)
         if unknown:
             raise DeclGraphExtractionError(
                 returncode=result.get("returncode"), timed_out=False,
                 diagnostics=f"ISOLATE for modules outside the batch: {sorted(unknown)}",
-                declarations=len(decls), root_module=root_module,
+                declarations=finished[0], root_module=root_module,
             )
-        remaining(root_module, len(batch_decls))
-        decls.extend(batch_decls)
-        for source, target in batch_deps:
+        remaining(root_module, len(batch.decls))
+        batch.children = [_Batch([root]) for root in dict.fromkeys(isolated)]
+
+    top = [
+        _Batch(modules[index:index + _ROOTS_PER_PROCESS])
+        for index in range(0, len(modules), _ROOTS_PER_PROCESS)
+    ]
+    # Batches not yet started, earliest in assembly order first, so that one
+    # worker runs them exactly in the order of the sequential extraction.
+    queue = deque(top)
+    imported_namespaces: set[str] = set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        running: dict[Future, tuple[_Batch, int]] = {}
+        slots = list(range(workers - 1, -1, -1))
+        try:
+            while queue or running:
+                while queue and slots:
+                    batch, slot = queue.popleft(), slots.pop()
+                    running[pool.submit(run, batch, slot)] = (batch, slot)
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in done:
+                    batch, slot = running.pop(future)
+                    future.result()
+                    slots.append(slot)
+                    finished[0] += len(batch.decls)
+                    # A set: merged now, not kept per batch (a copy of most
+                    # of Mathlib's namespaces in each).
+                    imported_namespaces |= batch.namespaces
+                    batch.namespaces = set()
+                    if known[0] is None and imported_namespaces:
+                        env.write_file_bytes(_DUMP_KEEP_NAMESPACES_PATH, "".join(
+                            namespace + "\n" for namespace in sorted(imported_namespaces)).encode("utf-8"))
+                        known[0] = _DUMP_KEEP_NAMESPACES_PATH
+                    queue.extendleft(reversed(batch.children))
+        except BaseException:
+            # Stop the other workers' processes rather than wait for them.
+            for future in running:
+                future.cancel()
+            cancel = getattr(env, "cancel_running", None)
+            if cancel is not None:
+                cancel()
+            raise
+
+    decls: list[DeclRange] = []
+    deps: Dependencies = {}
+    stack = list(reversed(top))
+    while stack:
+        batch = stack.pop()
+        decls.extend(batch.decls)
+        for source, target in batch.deps:
             deps.setdefault(source, set()).add(target)
-        imported_namespaces |= batch_namespaces
-        queue.extendleft([root] for root in reversed(list(dict.fromkeys(isolated))))
+        stack.extend(reversed(batch.children))
     return decls, deps, imported_namespaces
