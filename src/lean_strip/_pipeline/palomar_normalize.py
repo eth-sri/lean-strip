@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable
 
 from lean_strip.lakefile import field_indent, path_dependency_dirs
+from lean_strip.lake_config import evaluated_libraries
 
 
 ROOT_BUILD_METADATA = {
@@ -734,6 +735,49 @@ def _lean_library_candidates(
     return candidates
 
 
+def _field_span(section: str, name: str) -> tuple[int, int] | None:
+    """The whole layout-delimited field, including a computed expression."""
+    match = re.search(rf"(?m)^(?P<indent>[ \t]+){name}[ \t]*:=[^\n]*", section)
+    if match is None:
+        return None
+    end = match.end()
+    indent = len(match.group("indent").expandtabs())
+    for line in section[end:].splitlines(keepends=True):
+        if not line.strip():
+            end += len(line)
+            continue
+        width = len(line) - len(line.lstrip(" \t"))
+        if width <= indent:
+            break
+        end += len(line)
+    # Keep the separating newline outside the replacement.
+    return match.start(), len(section[:end].rstrip("\n"))
+
+
+def _computed_fields(library: dict[str, object]) -> bool:
+    section = str(library["section"])
+    for field in ("roots", "globs"):
+        full = _field_span(section, field)
+        literal = library[field + "_span"]
+        if full is not None and (literal is None or
+                section[literal[1]:full[1]].split("--", 1)[0].strip()):
+            return True
+    return False
+
+
+def _resolve_libraries(root: Path, libraries: list[dict[str, object]]) -> None:
+    """Use Lake's evaluated arrays when source syntax cannot determine ownership."""
+    resolved = {library["name"]: library for library in evaluated_libraries(root)}
+    for library in libraries:
+        actual = resolved.get(library["name"])
+        if actual is None:
+            raise ValueError(f"Lake did not resolve library {library['name']!r}")
+        for field in ("roots", "globs"):
+            library[field] = list(actual[field])
+            library[field + "_span"] = _field_span(str(library["section"]), field)
+        library["evaluated"] = True
+
+
 def _render_lean_roots(roots: list[str], indent: str = "  ") -> str:
     return indent + "roots := #[" + ", ".join(f"`{module}" for module in roots) + "]"
 
@@ -783,6 +827,11 @@ def _globs_cover(library: dict[str, object], modules: list[str]) -> bool:
     beyond Lean's maximum recursion depth.
     """
 
+    if library.get("evaluated"):
+        return bool(library["globs"]) and all(
+            any(_module_matches_toml_glob(glob, module) for glob in library["globs"])
+            for module in modules
+        )
     span = library["globs_span"]
     if span is None:
         return False
@@ -809,6 +858,10 @@ def synchronize_lakefile_lean_roots(
     libraries = _lean_libraries(original)
     if not libraries:
         raise ValueError("lakefile.lean has no static lean_lib declaration")
+    if any(_computed_fields(lib) for lib in libraries) or any(
+        len(_lean_library_candidates(libraries, module)) != 1 for module in roots
+    ):
+        _resolve_libraries(root, libraries)
     assignments: dict[int, list[str]] = {}
     for module in roots:
         candidates = _lean_library_candidates(libraries, module)
@@ -866,6 +919,13 @@ def synchronize_lakefile_lean_roots(
     for start, end, replacement in reversed(replacements):
         rewritten = rewritten[:start] + replacement + rewritten[end:]
     rewritten_libraries = _lean_libraries(rewritten)
+    # Unchanged computed fields retain Lake's evaluated configuration; rewritten
+    # libraries now have explicit literals and must pass the static validation.
+    by_name = {library["name"]: library for library in libraries}
+    for library in rewritten_libraries:
+        prior = by_name[library["name"]]
+        if prior.get("evaluated") and prior["section"] == library["section"]:
+            library.update(roots=prior["roots"], globs=prior["globs"], evaluated=True)
     for module in roots:
         candidates = _lean_library_candidates(rewritten_libraries, module)
         if len(candidates) != 1:

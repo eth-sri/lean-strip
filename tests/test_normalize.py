@@ -113,3 +113,64 @@ def test_quoted_module_components_are_compared_in_canonical_form():
     assert canonical_module_name("Foo.«Adic spaces».Bar") == "Foo.«Adic spaces».Bar"
     assert canonical_module_name("Mathlib.Data.Nat") == "Mathlib.Data.Nat"
     assert canonical_module_name("«A.B».C") == "«A.B».C"
+
+
+def test_computed_roots_and_concatenated_globs_use_lakes_configuration(tmp_path, monkeypatch):
+    # Sol P18: the owner is GS even though GSCayleyCharts has no GS. prefix.
+    text = '''import Lake
+open Lake DSL
+package gs
+def gsRoots : Array Lean.Name := #[`GS, `GSCayleyCharts]
+lean_lib GS where
+  roots := gsRoots
+  globs := #[.submodules `GS] ++ gsRoots.map Glob.one
+lean_lib Solution
+lean_lib Challenge
+'''
+    path = tmp_path / "lakefile.lean"
+    path.write_text(text)
+    monkeypatch.setattr(normalize, "evaluated_libraries", lambda root: [
+        {"name": "GS", "roots": ["GS", "GSCayleyCharts"],
+         "globs": ["GS.+", "GS", "GSCayleyCharts"]},
+        {"name": "Solution", "roots": ["Solution"], "globs": ["Solution"]},
+        {"name": "Challenge", "roots": ["Challenge"], "globs": ["Challenge"]},
+    ])
+    report = normalize.synchronize_lakefile_lean_roots(tmp_path, ("GSCayleyCharts", "Solution"))
+    assert report["status"] == "unchanged"
+    assert path.read_text() == text
+
+
+def test_computed_fields_are_replaced_whole_when_narrowing(tmp_path, monkeypatch):
+    text = '''import Lake
+open Lake DSL
+package p
+lean_lib Other where
+  roots := chooseRoots
+  globs := #[.one `Other] ++
+    chooseMoreGlobs
+'''
+    path = tmp_path / "lakefile.lean"
+    path.write_text(text)
+    monkeypatch.setattr(normalize, "evaluated_libraries", lambda root: [
+        {"name": "Other", "roots": ["Other"], "globs": ["Other"]},
+    ])
+    report = normalize.synchronize_lakefile_lean_roots(tmp_path, ("Other.Kept",))
+    rewritten = path.read_text()
+    assert report["status"] == "rewritten"
+    assert "roots := #[`Other.Kept]" in rewritten
+    assert "chooseRoots" not in rewritten
+    assert "chooseMoreGlobs" not in rewritten
+    assert "globs :=" not in rewritten
+
+
+def test_evaluated_configuration_still_rejects_ambiguous_owners(tmp_path, monkeypatch):
+    import pytest
+    path = tmp_path / "lakefile.lean"
+    text = 'import Lake\nopen Lake DSL\npackage p\nlean_lib A\nlean_lib B\n'
+    path.write_text(text)
+    monkeypatch.setattr(normalize, "evaluated_libraries", lambda root: [
+        {"name": name, "roots": ["Shared"], "globs": ["Shared.*"]} for name in ["A", "B"]
+    ])
+    with pytest.raises(ValueError, match="exactly one lean_lib"):
+        normalize.synchronize_lakefile_lean_roots(tmp_path, ("Shared.X",))
+    assert path.read_text() == text

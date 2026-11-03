@@ -24,6 +24,30 @@ COMPARATOR = {"challenge_module": "Challenge", "solution_module": "Solution",
               "theorem_names": ["main_thm"], "permitted_axioms": []}
 
 
+def test_graph_only_resolves_computed_lake_library_roots(tmp_path):
+    root = _project(tmp_path, {
+        "lakefile.lean": '''import Lake
+open Lake DSL
+package computed
+def libRoots : Array Lean.Name := #[`Lib, `Extra]
+lean_lib Lib where
+  roots := libRoots
+  globs := #[.submodules `Lib] ++ libRoots.map Glob.one
+lean_lib Solution
+lean_lib Challenge
+''',
+        "Lib.lean": "def unused : Nat := 7\n",
+        "Extra.lean": "def answer : Nat := 42\n",
+        "Solution.lean": "import Extra\ntheorem main_thm : answer = 42 := rfl\n",
+        "Challenge.lean": "import Extra\ntheorem main_thm : answer = 42 := sorry\n",
+    })
+    original = {p.relative_to(root): p.read_bytes() for p in root.glob('*.lean')}
+    assert cli.main([str(root), '--graph-only', '--jobs', '2', '--quiet']) == 0
+    assert {p.relative_to(root): p.read_bytes() for p in root.glob('*.lean')} == original
+    graph = json.loads((root / '.lean-strip/dependency-graph.json').read_text())
+    assert {'answer', 'main_thm'} <= {node['name'] for node in graph['nodes']}
+
+
 def _project(root: Path, files: dict[str, str], comparator: dict = COMPARATOR) -> Path:
     for relative, text in {"lean-toolchain": TOOLCHAIN,
                            "comparator.json": json.dumps(comparator), **files}.items():
