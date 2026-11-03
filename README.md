@@ -93,8 +93,12 @@ copies of the same name with different dependencies and statuses. Kernel extract
 queries modules in batches, one fresh process and environment per batch, and reports
 for each module what an environment of its own imports would give. A module whose
 imports reach a name that several loaded modules declare is queried again on its own,
-and a batch that fails is split until the failing module runs alone. All processes
-share one timeout, and any failed module aborts the graph. `.ilean`
+and a batch that fails is split until the failing module runs alone. Up to `--jobs`
+batches run at once, with the query compiled natively when the toolchain can build it,
+and the records and their order are those of one batch at a time. All processes
+share one timeout, and any failed module aborts the graph. Finished batches are saved
+to `.lean-strip/graph-checkpoint.jsonl`, so a rerun on the same sources after a timeout
+or interruption runs only the rest. `.ilean`
 references retain their defining module. Edges use indexes into the physical `nodes`
 array. `ambiguous_edges` records source and target candidate indexes plus the evidence bitmask when a reference has
 multiple possible providers. Static discovery conservatively retains candidate targets;
