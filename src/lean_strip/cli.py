@@ -824,6 +824,8 @@ def main(argv: list[str] | None = None) -> int:
             file_workers=args.jobs,
             clean_certify=args.clean_certify,
             graph_only=args.graph_only,
+            # Outside `diagnostics`, which every run starts empty.
+            graph_checkpoint=state / "graph-checkpoint.jsonl",
         )
         result = run_strip(ws, settings, console.stage)
 

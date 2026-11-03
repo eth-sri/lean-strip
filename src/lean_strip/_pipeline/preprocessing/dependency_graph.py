@@ -5,7 +5,9 @@ layers found it. Callers own builds and source snapshots.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 from lean_strip._pipeline.preprocessing import ilean as lean_ilean, strip as lean_strip
@@ -133,13 +135,18 @@ def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
                              timeout: int = 3600,
                              workers: int = 1,
                              allow_missing_sources: bool = False,
-                             allow_empty: bool = False) -> DependencyGraph:
+                             allow_empty: bool = False,
+                             checkpoint: Path | None = None,
+                             checkpoint_inputs: str = "",
+                             log: Callable[[str], None] | None = None) -> DependencyGraph:
     """Collect all static evidence from an already built, matching source state.
 
     A failed .olean query or incomplete .ilean set is an error, not an empty
     graph. Source mapping is required unless ``allow_missing_sources`` is set;
     ``modules=None`` discovers every built project module. ``workers`` bounds
-    the Lean processes that read .olean files at once.
+    the Lean processes that read .olean files at once. ``checkpoint`` and
+    ``checkpoint_inputs`` make that query resumable (see
+    read_olean_declarations); ``log`` receives its notes.
     """
     if modules is None:
         modules = discover_modules(env)
@@ -149,7 +156,8 @@ def collect_dependency_graph(env: Any, originals: Mapping[str, str], *,
     if not modules:
         raise RuntimeError("No project modules discovered for dependency graph")
     declarations, kernel, namespaces = read_olean_declarations(
-        env, modules=modules, timeout=timeout, workers=workers)
+        env, modules=modules, timeout=timeout, workers=workers,
+        checkpoint=checkpoint, checkpoint_inputs=checkpoint_inputs, log=log)
     if not declarations and allow_empty:
         return DependencyGraph([], {}, namespaces, originals, {}, {},
                                {"kernel": set(), "ilean": set(), "source_text": set()})

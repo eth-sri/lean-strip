@@ -5,11 +5,15 @@ an independently published dependency graph. Use dependency_graph for graphs.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .identity import Dependencies
@@ -598,10 +602,165 @@ class _Batch:
     deps: list[tuple[tuple[str, str], tuple[str, str]]] = field(default_factory=list)
     namespaces: set[str] = field(default_factory=set)
     children: list["_Batch"] = field(default_factory=list)
+    # Failed: the children are its halves.
+    split: bool = False
+
+
+# Bumped when the checkpoint's lines change meaning.
+_CHECKPOINT_FORMAT = 1
+_CHECKPOINT_FIELDS = {
+    "script": "graph script", "modules": "module list", "inputs": "inputs",
+    "roots_per_process": "batch size",
+}
+_DECL_KEYS = {"name", "module", "start_line", "start_col", "end_line", "end_col", "kind", "meta"}
+
+
+def _json_line(row: dict[str, Any]) -> bytes:
+    return (json.dumps(row, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _checked_record(row: Any) -> dict[str, Any]:
+    """A saved batch outcome as written by _Checkpoint.save; ValueError otherwise."""
+    def strings(value: Any) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+    if not isinstance(row, dict) or not strings(row.get("roots")) or not row["roots"]:
+        raise ValueError("no roots")
+    if row.get("split") is True:
+        if len(row["roots"]) < 2:
+            raise ValueError("a single root cannot split")
+        return row
+    decls, deps = row.get("decls"), row.get("deps")
+    if (not isinstance(decls, list) or not all(isinstance(d, dict) and set(d) == _DECL_KEYS for d in decls)
+            or not isinstance(deps, list) or not all(strings(edge) and len(edge) == 4 for edge in deps)
+            or not strings(row.get("namespaces")) or not strings(row.get("isolated"))
+            or not set(row["isolated"]) <= set(row["roots"])):
+        raise ValueError("malformed batch record")
+    return row
+
+
+class _Checkpoint:
+    """The batches that have finished, on disk, so that a rerun resumes after them.
+
+    The first line names what the records were made from (the script, module
+    list, inputs and batch size); each further line is one batch's outcome,
+    keyed by its roots: split (it failed, and its halves follow), or its
+    records and its ISOLATE roots. Replayed in queue order, they rebuild the
+    batch tree of the interrupted run, so the assembly is the same. A record is
+    appended once its batch is done; a line an interruption cut short is
+    dropped on loading. A checkpoint made from anything else is replaced.
+    Nothing here can fail the extraction: an unwritable file only stops saving.
+    """
+
+    def __init__(self, path: Path, header: dict[str, Any], log: Callable[[str], None]) -> None:
+        self.path = path
+        self.log = log
+        self.saved: dict[tuple[str, ...], dict[str, Any]] = {}
+        self.records = 0
+        self.stream = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            end = self._load(header)
+            if end is None:
+                self.saved = {}
+                self.stream = path.open("wb")
+                self.stream.write(_json_line(header))
+                self.stream.flush()
+            else:
+                self.stream = path.open("r+b")
+                self.stream.truncate(end)
+                self.stream.seek(end)
+        except OSError as error:
+            log(f"graph checkpoint {path} not used: {error}")
+            self.close()
+            self.saved = {}
+            return
+        self.records = len(self.saved)
+        if self.saved:
+            log(f"graph checkpoint {path}: resuming after {len(self.saved)} finished batches")
+
+    def _load(self, header: dict[str, Any]) -> int | None:
+        """Read the saved records; the offset to append at, or None to start afresh."""
+        try:
+            data = self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+        end = data.find(b"\n")
+        try:
+            found = json.loads(data[:end]) if end >= 0 else None
+        except ValueError:
+            found = None
+        if not isinstance(found, dict) or found.get("format") != header["format"]:
+            self.log(f"graph checkpoint {self.path} ignored: not a checkpoint of this lean-strip; starting afresh")
+            return None
+        differ = [label for key, label in _CHECKPOINT_FIELDS.items() if found.get(key) != header[key]]
+        if differ:
+            self.log(f"graph checkpoint {self.path} ignored: made for a different "
+                     f"{', '.join(differ)}; starting afresh")
+            return None
+        end += 1
+        while end < len(data):
+            line_end = data.find(b"\n", end)
+            try:
+                if line_end < 0:
+                    raise ValueError("no line end")
+                record = _checked_record(json.loads(data[end:line_end]))
+            except ValueError:
+                self.log(f"graph checkpoint {self.path}: dropped an incomplete record at its end")
+                break
+            self.saved[tuple(record["roots"])] = record
+            end = line_end + 1
+        return end
+
+    def restore(self, batch: _Batch) -> bool:
+        """Give ``batch`` its saved outcome, if there is one."""
+        record = self.saved.pop(tuple(batch.roots), None)
+        if record is None:
+            return False
+        if record.get("split"):
+            half = len(batch.roots) // 2
+            batch.split = True
+            batch.children = [_Batch(batch.roots[:half]), _Batch(batch.roots[half:])]
+        else:
+            batch.decls = record["decls"]
+            batch.deps = [((module, name), (target_module, target)) for module, name, target_module, target
+                          in record["deps"]]
+            batch.namespaces = set(record["namespaces"])
+            batch.children = [_Batch([root]) for root in record["isolated"]]
+        return True
+
+    def save(self, batch: _Batch) -> None:
+        if self.stream is None:
+            return
+        row: dict[str, Any] = {"roots": batch.roots}
+        if batch.split:
+            row["split"] = True
+        else:
+            row.update(decls=batch.decls, deps=[[*source, *target] for source, target in batch.deps],
+                       namespaces=sorted(batch.namespaces),
+                       isolated=[child.roots[0] for child in batch.children])
+        try:
+            self.stream.write(_json_line(row))
+            self.stream.flush()
+        except OSError as error:
+            self.log(f"graph checkpoint {self.path}: no further batches saved: {error}")
+            self.close()
+            return
+        self.records += 1
+
+    def close(self) -> None:
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except OSError:
+                pass
+            self.stream = None
 
 
 def read_olean_declarations(
     env: Any, modules: list[str], *, timeout: int = 3600, workers: int = 1,
+    checkpoint: Path | None = None, checkpoint_inputs: str = "",
+    log: Callable[[str], None] | None = None,
 ) -> tuple[list[DeclRange], Dependencies, set[str]]:
     """Run the keep-graph Lean script; return declarations, edges, namespaces.
 
@@ -624,6 +783,12 @@ def read_olean_declarations(
     one timeout. No graph is returned unless every root succeeds within that
     budget.
 
+    With `checkpoint`, a file path, each finished batch is saved there, and a
+    later call with the same modules, `checkpoint_inputs` (a digest of what
+    the .olean files were built from) and script runs only the batches not
+    yet saved; the result is that of one uninterrupted call. `log` receives a
+    line about what the checkpoint was used for.
+
     Requires `lake build` to have succeeded so .olean files exist.
     Raises DeclGraphExtractionError if the query fails.
     """
@@ -632,6 +797,30 @@ def read_olean_declarations(
         return [], {}, set()
     workers = max(1, workers)
     deadline = time.monotonic() + timeout
+    log = log or (lambda _line: None)
+    saved = None if checkpoint is None else _Checkpoint(checkpoint, {
+        "format": _CHECKPOINT_FORMAT,
+        "script": hashlib.sha256(_DUMP_KEEP_LEAN.encode()).hexdigest(),
+        "modules": hashlib.sha256("\n".join(modules).encode()).hexdigest(),
+        "inputs": checkpoint_inputs,
+        "roots_per_process": _ROOTS_PER_PROCESS,
+    }, log)
+    try:
+        return _read_batches(env, modules, deadline, workers, saved)
+    except BaseException:
+        if saved is not None and saved.records:
+            log(f"graph checkpoint {checkpoint}: {saved.records} finished batches saved; "
+                "a rerun with the same inputs resumes from them")
+        raise
+    finally:
+        if saved is not None:
+            saved.close()
+
+
+def _read_batches(
+    env: Any, modules: list[str], deadline: float, workers: int, saved: _Checkpoint | None,
+) -> tuple[list[DeclRange], Dependencies, set[str]]:
+    """The batches of read_olean_declarations, with those `saved` holds not run again."""
     # Declarations of the batches that have succeeded so far, for error details
     # (updated by the scheduling thread only).
     finished = [0]
@@ -645,11 +834,17 @@ def read_olean_declarations(
             )
         return seconds
 
-    _install_dump_keep_script(env, timeout=remaining())
-    native = _compile_dump_keep_script(env, timeout=remaining())
+    # The script is installed before the first process that needs it, which a
+    # complete checkpoint leaves out.
+    native: list[bool | None] = [None]
 
-    payload = ("\n".join(modules) + "\n").encode("utf-8")
-    env.write_file_bytes(_DUMP_KEEP_MODULES_PATH, payload)
+    def prepare() -> None:
+        if native[0] is not None:
+            return
+        _install_dump_keep_script(env, timeout=remaining())
+        native[0] = _compile_dump_keep_script(env, timeout=remaining())
+        payload = ("\n".join(modules) + "\n").encode("utf-8")
+        env.write_file_bytes(_DUMP_KEEP_MODULES_PATH, payload)
 
     # Every process reports the namespaces of all of Mathlib again (150,000
     # lines per QRH SIL root); after the first batch, only new ones.
@@ -659,7 +854,7 @@ def read_olean_declarations(
         arguments = f"--modules-file {_DUMP_KEEP_MODULES_PATH} --roots-file {roots_path}"
         if known[0] is not None:
             arguments += f" --known-namespaces-file {known[0]}"
-        if native:
+        if native[0]:
             return f"cd /testbed && . {_DUMP_KEEP_ENV_PATH} && exec {_DUMP_KEEP_BINARY_PATH} {arguments}"
         # One invocation per batch releases Lean's imports on exit. The
         # workspace cancels the entire Lake/Lean process group if the shared
@@ -711,6 +906,7 @@ def read_olean_declarations(
         if failed and len(roots) > 1 and not result.get("timed_out"):
             half = len(roots) // 2
             batch.decls, batch.deps, batch.namespaces = [], [], set()
+            batch.split = True
             batch.children = [_Batch(roots[:half]), _Batch(roots[half:])]
             return
         if failed:
@@ -743,29 +939,50 @@ def read_olean_declarations(
     # worker runs them exactly in the order of the sequential extraction.
     queue = deque(top)
     imported_namespaces: set[str] = set()
+
+    def finish(batch: _Batch) -> None:
+        """Take in a batch that is done and queue its children."""
+        finished[0] += len(batch.decls)
+        # A set: merged now, not kept per batch (a copy of most of Mathlib's
+        # namespaces in each).
+        imported_namespaces.update(batch.namespaces)
+        batch.namespaces = set()
+        if known[0] is None and imported_namespaces:
+            env.write_file_bytes(_DUMP_KEEP_NAMESPACES_PATH, "".join(
+                namespace + "\n" for namespace in sorted(imported_namespaces)).encode("utf-8"))
+            known[0] = _DUMP_KEEP_NAMESPACES_PATH
+        queue.extendleft(reversed(batch.children))
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         running: dict[Future, tuple[_Batch, int]] = {}
         slots = list(range(workers - 1, -1, -1))
         try:
             while queue or running:
-                while queue and slots:
-                    batch, slot = queue.popleft(), slots.pop()
-                    running[pool.submit(run, batch, slot)] = (batch, slot)
+                while queue:
+                    if saved is not None and saved.restore(queue[0]):
+                        finish(queue.popleft())
+                    elif slots:
+                        prepare()
+                        batch, slot = queue.popleft(), slots.pop()
+                        running[pool.submit(run, batch, slot)] = (batch, slot)
+                    else:
+                        break
+                if not running:
+                    continue
                 done, _ = wait(running, return_when=FIRST_COMPLETED)
+                # The batches that did finish are saved before a failure is raised.
+                failed: Future | None = None
                 for future in done:
                     batch, slot = running.pop(future)
-                    future.result()
                     slots.append(slot)
-                    finished[0] += len(batch.decls)
-                    # A set: merged now, not kept per batch (a copy of most
-                    # of Mathlib's namespaces in each).
-                    imported_namespaces |= batch.namespaces
-                    batch.namespaces = set()
-                    if known[0] is None and imported_namespaces:
-                        env.write_file_bytes(_DUMP_KEEP_NAMESPACES_PATH, "".join(
-                            namespace + "\n" for namespace in sorted(imported_namespaces)).encode("utf-8"))
-                        known[0] = _DUMP_KEEP_NAMESPACES_PATH
-                    queue.extendleft(reversed(batch.children))
+                    if future.exception() is not None:
+                        failed = failed or future
+                        continue
+                    if saved is not None:
+                        saved.save(batch)
+                    finish(batch)
+                if failed is not None:
+                    failed.result()
         except BaseException:
             # Stop the other workers' processes rather than wait for them.
             for future in running:

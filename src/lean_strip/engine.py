@@ -77,6 +77,9 @@ class StripSettings:
     theorem_names: tuple[str, ...] = ()
     definition_names: tuple[str, ...] = ()
     permitted_axioms: tuple[str, ...] = ()
+    # Where the .olean graph query saves finished batches, so that a rerun on
+    # the same sources resumes it; None saves nothing.
+    graph_checkpoint: Path | None = None
 
 
 @dataclass
@@ -106,6 +109,29 @@ def _parse_json_messages(output: str) -> list[dict[str, object]]:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+# What the build reads besides the project's own sources.
+_BUILD_INPUTS = ("lean-toolchain", "lake-manifest.json", "lakefile.lean", "lakefile.toml",
+                 ".lake/package-overrides.json")
+
+
+def _graph_inputs(ws: LocalWorkspace, sources: dict[str, str]) -> str:
+    """A digest of what the .olean files were built from, for the graph checkpoint.
+
+    The sources as built, the toolchain and package pins, and the vendored
+    path dependencies' sources. (Lean's .olean bytes are not hashed: the
+    grind-normalized files are rebuilt on every run.)
+    """
+    digest = hashlib.sha256()
+    paths = [f"/testbed/{relative}" for relative in _BUILD_INPUTS if (ws.root / relative).is_file()]
+    for dependency in ws.project_skip:
+        paths += [f"/testbed/{dependency}/{relative}" for relative in iter_lean_files(ws.root / dependency)]
+    files = {**sources, **ws.snapshot(paths)}
+    for path in sorted(files):
+        digest.update(f"{len(path)}:{path}{len(files[path])}:".encode())
+        digest.update(files[path].encode())
+    return digest.hexdigest()
 
 
 # Incremental rebuilds of projects using Lean's `module` system can start a
@@ -988,6 +1014,9 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         graph = collect_dependency_graph(
             ws, originals, modules=None, timeout=timeout, workers=settings.file_workers,
             allow_missing_sources=True, allow_empty=True,
+            checkpoint=settings.graph_checkpoint,
+            checkpoint_inputs=_graph_inputs(ws, originals) if settings.graph_checkpoint else "",
+            log=_t.detail,
         )
         decls, deps, imported_namespaces = (
             graph.declarations, graph.dependencies, graph.imported_namespaces,
