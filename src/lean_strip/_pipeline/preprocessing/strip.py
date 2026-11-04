@@ -1666,11 +1666,17 @@ def collect_implicit_dependency_roots(
         implicit |= local_index.select(detect_force_keep_kinds(local, sources, mod_path))
     attributed |= scoped_source_roots(decls, originals, mod_path, detect_attribute_command_roots)
     implicit |= scoped_source_roots(decls, originals, mod_path, detect_open_hiding_roots)
-    for detector in (detect_open_renaming_roots, detect_run_command_roots, detect_notation_body_roots):
+    for detector in (detect_open_renaming_roots, detect_run_command_roots):
         implicit |= scoped_source_roots(decls, originals, mod_path, detector)
+    # Resolved among the providers the notation's own file imports, so a kept
+    # notation already reaches these; module pruning need not re-export them.
+    notation = scoped_source_roots(decls, originals, mod_path, detect_notation_body_roots)
+    notation_body = notation - attributed - implicit
+    implicit |= notation
     return {
         "attributed": attributed,
         "implicit_kinds": implicit,
+        "notation_body_only": notation_body,
         "open_namespace_candidates": index.select(detect_open_namespace_roots(decls, originals)),
     }
 
@@ -3502,6 +3508,10 @@ def declaration_dependency_closure(
     return seen
 
 
+def _imported_modules(file_text: str) -> set[str]:
+    return {match.group(1) for match in _IMPORT_RE.finditer(file_text)}
+
+
 def _ensure_imports(file_text: str, modules: set[str]) -> str:
     """Add missing ordinary imports without otherwise rewriting a hub file."""
 
@@ -3597,6 +3607,7 @@ def plan_protected_module_prune(
     protected_names: set[DeclId],
     entry_module: str,
     *,
+    support_names: set[DeclId] | None = None,
     extra_keep_modules: set[str] | None = None,
     known_module_paths: dict[str, str] | None = None,
     collapse_entry_import_hubs: bool = False,
@@ -3609,7 +3620,10 @@ def plan_protected_module_prune(
     The entry module is always kept. When it is a declaration-free umbrella,
     imports of deleted branches are removed and imports of protected owner
     modules are ensured directly, so an obsolete re-export cannot make a whole
-    branch live.
+    branch live. ``support_names`` are protected roots kept only so that other
+    kept code still elaborates (notation bodies, comparator realization
+    sites); the umbrella imports their owners only when its other imports do
+    not already reach them.
 
     The returned source mapping omits deleted files and includes deterministic
     import rewrites. engine.py applies the plan; the final builds certify it.
@@ -3652,6 +3666,11 @@ def plan_protected_module_prune(
         protected_names,
     )
     protected_modules = {module for name in protected_names for module in owners_by_name[name]}
+    support_names = protected_names & index.select(support_names or set())
+    export_modules = {
+        module for name in protected_names - support_names for module in owners_by_name[name]
+    }
+    support_modules = protected_modules - export_modules
     live_modules = {module for name in live_declarations for module in owners_by_name.get(name, ())}
     explicit_keep_modules = set(extra_keep_modules or ())
     unknown_keep_modules = explicit_keep_modules - set(graph)
@@ -3701,7 +3720,11 @@ def plan_protected_module_prune(
         # dead intermediary hubs.
         if module == entry_module and entry_module not in live_modules:
             updated = _ensure_imports(
-                updated, protected_modules - {entry_module}
+                updated, export_modules - {entry_module}
+            )
+            reached = _closure(graph, _imported_modules(updated))
+            updated = _ensure_imports(
+                updated, support_modules - reached - {entry_module}
             )
         elif module == entry_module and elided_entry_import_hubs:
             updated = _ensure_imports(updated, live_modules - {entry_module})
@@ -3715,6 +3738,7 @@ def plan_protected_module_prune(
         "schema": "protected_root_module_prune_v1",
         "entry_module": entry_module,
         "protected_modules": sorted(protected_modules),
+        "support_modules": sorted(support_modules),
         "explicit_keep_modules": sorted(explicit_keep_modules),
         "protected_declarations": sorted({name for _module, name in protected_names}),
         "protected_declaration_identities": identity_rows(protected_names),

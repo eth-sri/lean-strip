@@ -1137,6 +1137,11 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         )
         if closure_report is not None:
             report["comparator_closure"] = closure_report
+        # Roots only other kept code needs; an umbrella entry need not import them.
+        notation_body_only = implicit_roots["notation_body_only"]
+        support_roots = (
+            notation_body_only | declaration_index.select(realization_roots)
+        ) - (exact_environment_roots - notation_body_only)
         exact_environment_roots |= declaration_index.select(realization_roots)
         retention = lean_strip.plan_source_retention(
             decls, originals, mod_path,
@@ -1160,6 +1165,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
 
     # 5. Anonymous `example` ranges from the Lean frontend.
     module_root_decls = seed | command_roots | exact_environment_roots | retain_exact_decls
+    support_roots -= seed | command_roots | retain_exact_decls
     mod_path = _with_entry_module_path(mod_path, settings.entry_module, originals, graph.source_dirs)
     with stage("Example ranges") as _t:
         affected_example_paths = sorted(
@@ -1188,6 +1194,7 @@ def run_strip(ws: LocalWorkspace, settings: StripSettings, stage: Stage) -> Stri
         pre_prune = originals
         planned, module_prune = lean_strip.plan_protected_module_prune(
             originals, decls, deps, module_root_decls, settings.entry_module,
+            support_names=support_roots,
             extra_keep_modules=retain_exact_modules,
             known_module_paths=mod_path,
         )
